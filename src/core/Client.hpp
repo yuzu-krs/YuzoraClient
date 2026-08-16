@@ -2,6 +2,9 @@
 
 #include <mutex>
 
+#include "memory/SignatureManager.hpp"
+#include "version/VersionManager.hpp"
+
 namespace yuzora {
 
 // Lifecycle states of the client.
@@ -47,6 +50,13 @@ public:
 
 private:
     mutable std::mutex mutex_;
+
+    // Subsystems owned by the client. Initialized in declaration order,
+    // shut down in reverse order. v0.3+ code reaches them through accessors
+    // added when the first real consumer exists.
+    version::VersionManager versionManager_;
+    memory::SignatureManager signatureManager_;
+
     ClientState state_ = ClientState::Uninitialized;
 };
 

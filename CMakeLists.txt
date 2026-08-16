@@ -31,6 +31,13 @@ add_library(YuzoraClient SHARED
     src/dllmain.cpp
     src/core/Client.cpp
     src/core/Logger.cpp
+    src/core/SelfTest.cpp
+    src/memory/Memory.cpp
+    src/memory/Scanner.cpp
+    src/memory/Signature.cpp
+    src/memory/SignatureManager.cpp
+    src/version/GameVersion.cpp
+    src/version/VersionManager.cpp
 )
 
 target_include_directories(YuzoraClient PRIVATE
