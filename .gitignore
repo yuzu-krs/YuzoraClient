@@ -1,0 +1,12 @@
+# Build output
+build/
+out/
+
+# Visual Studio local state
+.vs/
+*.user
+
+# CMake in-source artifacts (should not happen, but stay safe)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
