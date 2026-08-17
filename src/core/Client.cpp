@@ -2,6 +2,7 @@
 
 #include "Logger.hpp"
 #include "SelfTest.hpp"
+#include "events/EventBus.hpp"
 
 namespace yuzora {
 
@@ -38,11 +39,29 @@ bool Client::initialize() {
         // below already reports whatever is registered.
         signatureManager_.setDefaultModule(versionManager_.gameModuleName());
         signatureManager_.scanAll();
+
+        // v0.3 scope: the hook foundation is verified by the standalone
+        // self-test. No production Minecraft hooks are registered yet -
+        // they arrive once real signatures/SDK land in a later milestone.
+        Logger::info("Production hooks: none registered yet (v0.3 scope: hook "
+                     "foundation only)");
+        hookManager_.installAll();
+        hookManager_.logDiagnostics();
     } else {
-        // Standalone (test loader) environment: validate the memory and
-        // signature foundation on our own module instead.
+        // Standalone (test loader) environment: validate the foundations on
+        // our own module instead.
         if (!runMemorySelfTest(signatureManager_)) {
             Logger::error("memory self-test failed; aborting initialization");
+            state_ = ClientState::Uninitialized;
+            return false;
+        }
+        if (!runEventSelfTest()) {
+            Logger::error("event self-test failed; aborting initialization");
+            state_ = ClientState::Uninitialized;
+            return false;
+        }
+        if (!runHookSelfTest(hookManager_)) {
+            Logger::error("hook self-test failed; aborting initialization");
             state_ = ClientState::Uninitialized;
             return false;
         }
@@ -70,6 +89,8 @@ bool Client::shutdown() {
     }
 
     // Subsystems are shut down here, in reverse initialization order.
+    hookManager_.uninstallAll();
+    events::EventBus::clearAllSubscriptions();
     signatureManager_.clear();
     versionManager_.reset();
 

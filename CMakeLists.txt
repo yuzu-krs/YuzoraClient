@@ -32,6 +32,9 @@ add_library(YuzoraClient SHARED
     src/core/Client.cpp
     src/core/Logger.cpp
     src/core/SelfTest.cpp
+    src/events/EventBus.cpp
+    src/hooks/Hook.cpp
+    src/hooks/HookManager.cpp
     src/memory/Memory.cpp
     src/memory/Scanner.cpp
     src/memory/Signature.cpp

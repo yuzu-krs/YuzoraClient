@@ -2,6 +2,7 @@
 
 #include <mutex>
 
+#include "hooks/HookManager.hpp"
 #include "memory/SignatureManager.hpp"
 #include "version/VersionManager.hpp"
 
@@ -56,6 +57,7 @@ private:
     // added when the first real consumer exists.
     version::VersionManager versionManager_;
     memory::SignatureManager signatureManager_;
+    hooks::HookManager hookManager_;
 
     ClientState state_ = ClientState::Uninitialized;
 };
