@@ -4,6 +4,7 @@
 
 #include "hooks/HookManager.hpp"
 #include "memory/SignatureManager.hpp"
+#include "sdk/Sdk.hpp"
 #include "version/VersionManager.hpp"
 
 namespace yuzora {
@@ -49,14 +50,19 @@ public:
 
     [[nodiscard]] ClientState state() const;
 
+    // SDK access: the sanctioned path to game internals. Valid between
+    // initialize() and shutdown(); reports "unavailable" rather than
+    // crashing when the game functions are not resolved.
+    [[nodiscard]] sdk::Sdk& sdk() noexcept { return sdk_; }
+
 private:
     mutable std::mutex mutex_;
 
     // Subsystems owned by the client. Initialized in declaration order,
-    // shut down in reverse order. v0.3+ code reaches them through accessors
-    // added when the first real consumer exists.
+    // shut down in reverse order: version -> signatures -> sdk -> hooks.
     version::VersionManager versionManager_;
     memory::SignatureManager signatureManager_;
+    sdk::Sdk sdk_;
     hooks::HookManager hookManager_;
 
     ClientState state_ = ClientState::Uninitialized;

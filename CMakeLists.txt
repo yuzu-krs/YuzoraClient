@@ -39,6 +39,7 @@ add_library(YuzoraClient SHARED
     src/memory/Scanner.cpp
     src/memory/Signature.cpp
     src/memory/SignatureManager.cpp
+    src/sdk/Sdk.cpp
     src/version/GameVersion.cpp
     src/version/VersionManager.cpp
 )

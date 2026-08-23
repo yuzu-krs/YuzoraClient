@@ -18,6 +18,11 @@
 #include "hooks/HookManager.hpp"
 #include "memory/Memory.hpp"
 #include "memory/Signature.hpp"
+#include "sdk/Sdk.hpp"
+#include "sdk/actor/Actor.hpp"
+#include "sdk/client/ClientInstance.hpp"
+#include "sdk/math/Vec2.hpp"
+#include "sdk/math/Vec3.hpp"
 
 namespace yuzora {
 
@@ -227,6 +232,33 @@ int selfTestAddHandler(int a, int b) {
     return reinterpret_cast<AddFunction>(g_selfTestTrampoline)(a, b);
 }
 
+// Writes a pointer into a fake-object byte buffer at the given offset.
+template <std::size_t N>
+void storePointer(std::array<std::uint8_t, N>& buffer, std::size_t offset,
+                  const void* value) {
+    const auto address = reinterpret_cast<std::uintptr_t>(value);
+    std::memcpy(buffer.data() + offset, &address, sizeof(address));
+}
+
+// x64 (Microsoft ABI) machine code for the synthesized SDK functions:
+//   getLocalPlayer:  mov rax, [rcx+8] ; ret
+//   getLevel:        mov rax, [rcx+0x10] ; ret
+//   getPosition:     returns the 12-byte Vec3 through the hidden return
+//                    buffer in RCX with the actor in RDX:
+//                    mov rax, rcx ; mov r8, [rdx+0x10] ; mov [rcx], r8
+//                    mov r8d, [rdx+0x18] ; mov [rcx+8], r8d ; ret
+constexpr std::array<std::uint8_t, 5> kGetLocalPlayerCode{0x48, 0x8B, 0x41, 0x08,
+                                                          0xC3};
+constexpr std::array<std::uint8_t, 5> kGetLevelCode{0x48, 0x8B, 0x41, 0x10, 0xC3};
+constexpr std::array<std::uint8_t, 19> kGetPositionCode{
+    0x48, 0x89, 0xC8,
+    0x4C, 0x8B, 0x42, 0x10,
+    0x4C, 0x89, 0x01,
+    0x44, 0x8B, 0x42, 0x18,
+    0x44, 0x89, 0x41, 0x08,
+    0xC3,
+};
+
 }  // namespace
 
 bool runHookSelfTest(hooks::HookManager& hookManager) {
@@ -311,6 +343,121 @@ bool runHookSelfTest(hooks::HookManager& hookManager) {
     VirtualFree(original, 0, MEM_RELEASE);
 
     Logger::info("Hook self-test {}", pass ? "passed (9/9)" : "FAILED");
+    return pass;
+}
+
+bool runSdkSelfTest(sdk::Sdk& sdk) {
+    Logger::info("SDK self-test (synthesized game objects inside this DLL only)");
+
+    bool pass = true;
+
+    // 1. Vec2 arithmetic, dot and length.
+    const sdk::Vec2 a{3.f, 4.f};
+    const sdk::Vec2 b{1.f, -1.f};
+    pass &= check(a + b == sdk::Vec2{4.f, 3.f} && a - b == sdk::Vec2{2.f, 5.f} &&
+                      a * 2.f == sdk::Vec2{6.f, 8.f} && a / 2.f == sdk::Vec2{1.5f, 2.f} &&
+                      a.dot(b) == -1.f && a.length() == 5.f,
+                  "Vec2 arithmetic, dot and length");
+
+    // 2. Vec3 arithmetic, dot, length and normalized.
+    const sdk::Vec3 v{1.f, 2.f, 3.f};
+    const sdk::Vec3 w{2.f, 3.f, 4.f};
+    const sdk::Vec3 tall{0.f, 0.f, 10.f};
+    pass &= check(v + w == sdk::Vec3{3.f, 5.f, 7.f} && v - w == sdk::Vec3{-1.f, -1.f, -1.f} &&
+                      v.dot(w) == 20.f && tall.length() == 10.f &&
+                      tall.normalized() == sdk::Vec3{0.f, 0.f, 1.f} &&
+                      sdk::Vec3{}.normalized() == sdk::Vec3{},
+                  "Vec3 arithmetic, dot, length and normalized");
+
+    // 3. An uninitialized SDK degrades to null, never crashes.
+    sdk.shutdown();
+    pass &= check(!sdk.isAvailable() && sdk.getClientInstance() == nullptr,
+                  "unavailable SDK is null-safe");
+
+    // Synthesize the fake game: a client instance whose player slot holds a
+    // local player with a planted Vec3 position, plus a level object.
+    std::array<std::uint8_t, 0x20> fakeClient{};
+    std::array<std::uint8_t, 0x20> fakePlayer{};
+    std::array<std::uint8_t, 0x08> fakeLevel{};
+
+    constexpr sdk::Vec3 kPlantedPosition{1.5f, 64.f, -7.25f};
+    std::memcpy(fakePlayer.data() + 0x10, &kPlantedPosition, sizeof(sdk::Vec3));
+    storePointer(fakeClient, 0x08, fakePlayer.data());
+    storePointer(fakeClient, 0x10, fakeLevel.data());
+
+    void* const code = VirtualAlloc(nullptr, 256, MEM_COMMIT | MEM_RESERVE,
+                                    PAGE_EXECUTE_READWRITE);
+    if (code == nullptr) {
+        Logger::error("cannot allocate executable memory for the SDK self-test");
+        return false;
+    }
+    auto* const codeBytes = static_cast<std::uint8_t*>(code);
+
+    // get getClientInstance: mov rax, imm64(fakeClient) ; ret
+    std::array<std::uint8_t, 11> getInstanceCode{0x48, 0xB8};
+    const auto clientAddress = reinterpret_cast<std::uintptr_t>(fakeClient.data());
+    std::memcpy(getInstanceCode.data() + 2, &clientAddress, sizeof(clientAddress));
+    getInstanceCode[10] = 0xC3;
+
+    std::memcpy(codeBytes + 0x00, getInstanceCode.data(), getInstanceCode.size());
+    std::memcpy(codeBytes + 0x40, kGetLocalPlayerCode.data(), kGetLocalPlayerCode.size());
+    std::memcpy(codeBytes + 0x80, kGetLevelCode.data(), kGetLevelCode.size());
+    std::memcpy(codeBytes + 0xC0, kGetPositionCode.data(), kGetPositionCode.size());
+    FlushInstructionCache(GetCurrentProcess(), code, 256);
+
+    sdk::SdkFunctions functions;
+    functions.getClientInstance = reinterpret_cast<void* (*)()>(codeBytes + 0x00);
+    functions.getLocalPlayer = reinterpret_cast<void* (*)(void*)>(codeBytes + 0x40);
+    functions.getLevel = reinterpret_cast<void* (*)(void*)>(codeBytes + 0x80);
+    functions.getPosition = reinterpret_cast<sdk::Vec3 (*)(void*)>(codeBytes + 0xC0);
+    sdk.initialize(functions);
+
+    // 4. The root resolves through the table.
+    sdk::ClientInstance* const client = sdk.getClientInstance();
+    pass &= check(client != nullptr && client->isValid(),
+                  "getClientInstance resolves the root");
+
+    // 5. The local player follows the pointer chain.
+    sdk::LocalPlayer* const player = (client != nullptr) ? client->getLocalPlayer() : nullptr;
+    pass &= check(player != nullptr && player->isValid(),
+                  "getLocalPlayer follows the pointer chain");
+
+    // 6. Position access crosses the x64 struct-return ABI correctly.
+    pass &= check(player != nullptr &&
+                      player->getPosition() == sdk::Vec3{1.5f, 64.f, -7.25f},
+                  "Actor::getPosition returns the planted Vec3");
+
+    // 7. The level follows the pointer chain.
+    pass &= check(client != nullptr && client->getLevel() != nullptr &&
+                      client->getLevel()->isValid(),
+                  "getLevel follows the pointer chain");
+
+    // 8. A null actor degrades to a zero vector.
+    const sdk::Actor nullActor{&sdk.functions(), nullptr};
+    pass &= check(nullActor.getPosition() == sdk::Vec3{},
+                  "null actor position is a zero vector");
+
+    // 9. Missing functions degrade to null instead of crashing.
+    {
+        sdk::Sdk partial;
+        sdk::SdkFunctions onlyRoot;
+        onlyRoot.getClientInstance = functions.getClientInstance;
+        partial.initialize(onlyRoot);
+        sdk::ClientInstance* const root = partial.getClientInstance();
+        pass &= check(root != nullptr && root->getLocalPlayer() == nullptr &&
+                          root->getLevel() == nullptr,
+                      "missing functions degrade to null");
+        partial.shutdown();
+    }
+
+    // 10. Diagnostics and shutdown.
+    sdk.logDiagnostics();
+    sdk.shutdown();
+    pass &= check(sdk.getClientInstance() == nullptr, "shutdown clears the SDK");
+
+    VirtualFree(code, 0, MEM_RELEASE);
+
+    Logger::info("SDK self-test {}", pass ? "passed (10/10)" : "FAILED");
     return pass;
 }
 

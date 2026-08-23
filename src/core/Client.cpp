@@ -40,6 +40,14 @@ bool Client::initialize() {
         signatureManager_.setDefaultModule(versionManager_.gameModuleName());
         signatureManager_.scanAll();
 
+        // v0.4 scope: the SDK resolves through the signature layer, but no
+        // production signatures exist yet - the SDK therefore reports
+        // itself unavailable, which is expected and not an error.
+        sdk_.resolveFromSignatures(signatureManager_);
+        sdk_.logDiagnostics();
+        Logger::info("Production SDK functions: none resolvable yet (signatures "
+                     "pending reverse engineering)");
+
         // v0.3 scope: the hook foundation is verified by the standalone
         // self-test. No production Minecraft hooks are registered yet -
         // they arrive once real signatures/SDK land in a later milestone.
@@ -62,6 +70,11 @@ bool Client::initialize() {
         }
         if (!runHookSelfTest(hookManager_)) {
             Logger::error("hook self-test failed; aborting initialization");
+            state_ = ClientState::Uninitialized;
+            return false;
+        }
+        if (!runSdkSelfTest(sdk_)) {
+            Logger::error("sdk self-test failed; aborting initialization");
             state_ = ClientState::Uninitialized;
             return false;
         }
@@ -91,6 +104,7 @@ bool Client::shutdown() {
     // Subsystems are shut down here, in reverse initialization order.
     hookManager_.uninstallAll();
     events::EventBus::clearAllSubscriptions();
+    sdk_.shutdown();
     signatureManager_.clear();
     versionManager_.reset();
 

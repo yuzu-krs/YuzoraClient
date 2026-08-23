@@ -2,6 +2,7 @@
 
 #include "hooks/HookManager.hpp"
 #include "memory/SignatureManager.hpp"
+#include "sdk/Sdk.hpp"
 
 namespace yuzora {
 
@@ -28,5 +29,14 @@ namespace yuzora {
 //
 // Returns true when every check passed.
 [[nodiscard]] bool runHookSelfTest(hooks::HookManager& hookManager);
+
+// Validates the SDK foundation against a tiny fake game synthesized inside
+// this DLL's own memory: math types, the resolved-function table, the
+// ClientInstance -> LocalPlayer -> Actor chain, position access through a
+// hand-written x64 function (verifying the struct-return ABI), null
+// safety and shutdown. No game memory is ever touched.
+//
+// Returns true when every check passed.
+[[nodiscard]] bool runSdkSelfTest(sdk::Sdk& sdk);
 
 }  // namespace yuzora
