@@ -4,6 +4,7 @@
 
 #include "hooks/HookManager.hpp"
 #include "memory/SignatureManager.hpp"
+#include "rendering/RenderManager.hpp"
 #include "sdk/Sdk.hpp"
 #include "version/VersionManager.hpp"
 
@@ -55,15 +56,33 @@ public:
     // crashing when the game functions are not resolved.
     [[nodiscard]] sdk::Sdk& sdk() noexcept { return sdk_; }
 
+    // Read-only subsystem views used by the overlay and diagnostics.
+    [[nodiscard]] const version::VersionManager& versionManager() const noexcept {
+        return versionManager_;
+    }
+    [[nodiscard]] const memory::SignatureManager& signatureManager() const noexcept {
+        return signatureManager_;
+    }
+    [[nodiscard]] const hooks::HookManager& hookManager() const noexcept {
+        return hookManager_;
+    }
+
 private:
+    // Assembles the overlay content from subsystem state. Called on the
+    // render thread after initialization; only reads initialized state
+    // (besides the SDK's internal view re-wrapping).
+    [[nodiscard]] rendering::OverlayInfo buildOverlay();
+
     mutable std::mutex mutex_;
 
     // Subsystems owned by the client. Initialized in declaration order,
-    // shut down in reverse order: version -> signatures -> sdk -> hooks.
+    // shut down in reverse order:
+    // version -> signatures -> sdk -> hooks -> rendering.
     version::VersionManager versionManager_;
     memory::SignatureManager signatureManager_;
     sdk::Sdk sdk_;
     hooks::HookManager hookManager_;
+    rendering::RenderManager renderManager_;
 
     ClientState state_ = ClientState::Uninitialized;
 };

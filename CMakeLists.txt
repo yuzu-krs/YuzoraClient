@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(YuzoraClient
-    VERSION 0.1.0
+    VERSION 0.5.0
     DESCRIPTION "YuzoraClient native DLL client"
     LANGUAGES CXX
 )
@@ -39,9 +39,26 @@ add_library(YuzoraClient SHARED
     src/memory/Scanner.cpp
     src/memory/Signature.cpp
     src/memory/SignatureManager.cpp
+    src/rendering/Font.cpp
+    src/rendering/RenderManager.cpp
+    src/rendering/Renderer.cpp
     src/sdk/Sdk.cpp
     src/version/GameVersion.cpp
     src/version/VersionManager.cpp
+)
+
+target_link_libraries(YuzoraClient PRIVATE
+    d3d11
+    dxgi
+    d3dcompiler
+    gdi32
+    user32
+)
+
+target_compile_definitions(YuzoraClient PRIVATE
+    YUZORA_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    YUZORA_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    YUZORA_VERSION_PATCH=${PROJECT_VERSION_PATCH}
 )
 
 target_include_directories(YuzoraClient PRIVATE

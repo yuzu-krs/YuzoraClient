@@ -41,6 +41,17 @@ bool HookManager::uninstallAll() {
     return all;
 }
 
+bool HookManager::remove(std::string_view name) {
+    for (auto it = hooks_.begin(); it != hooks_.end(); ++it) {
+        if ((*it)->name() == name) {
+            (*it)->uninstall();
+            hooks_.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 void HookManager::logDiagnostics() const {
     Logger::info("Hook diagnostics");
     for (const std::unique_ptr<Hook>& hook : hooks_) {

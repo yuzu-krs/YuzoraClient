@@ -18,6 +18,7 @@
 #include "hooks/HookManager.hpp"
 #include "memory/Memory.hpp"
 #include "memory/Signature.hpp"
+#include "rendering/RenderManager.hpp"
 #include "sdk/Sdk.hpp"
 #include "sdk/actor/Actor.hpp"
 #include "sdk/client/ClientInstance.hpp"
@@ -458,6 +459,172 @@ bool runSdkSelfTest(sdk::Sdk& sdk) {
     VirtualFree(code, 0, MEM_RELEASE);
 
     Logger::info("SDK self-test {}", pass ? "passed (10/10)" : "FAILED");
+    return pass;
+}
+
+bool runRenderSelfTest(rendering::RenderManager& renderManager) {
+    Logger::info("Render self-test (hidden D3D11 window inside this DLL only)");
+
+    bool pass = true;
+
+    // Hidden test window + its own swap chain: presenting it must drive the
+    // hook exactly like the game's frames would.
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = DefWindowProcW;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = L"YuzoraRenderSelfTest";
+    RegisterClassW(&windowClass);
+    HWND window = CreateWindowExW(0, L"YuzoraRenderSelfTest", L"", WS_OVERLAPPEDWINDOW,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, 320, 240, nullptr,
+                                  nullptr, windowClass.hInstance, nullptr);
+    if (window == nullptr) {
+        Logger::error("cannot create the render self-test window");
+        return false;
+    }
+
+    DXGI_SWAP_CHAIN_DESC description{};
+    description.BufferCount = 2;
+    description.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    description.OutputWindow = window;
+    description.SampleDesc.Count = 1;
+    description.Windowed = TRUE;
+    description.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+    Microsoft::WRL::ComPtr<IDXGISwapChain> swapChain;
+    HRESULT result = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+        &description, &swapChain, &device, nullptr, &context);
+    if (FAILED(result)) {
+        result = D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+            &description, &swapChain, &device, nullptr, &context);
+    }
+    if (FAILED(result) || swapChain == nullptr) {
+        Logger::error("cannot create the render self-test device (HRESULT 0x{:08X})",
+                      static_cast<unsigned>(result));
+        DestroyWindow(window);
+        return false;
+    }
+
+    // 1. Initialize installs the Present hook.
+    if (!renderManager.initialize([] {
+            rendering::OverlayInfo info;
+            info.titleLine = "YuzoraClient render self-test";
+            info.gameVersionLine = "Minecraft: not detected";
+            info.coordinatesLine = "XYZ: unavailable";
+            info.statusLine = "Render self-test status line";
+            return info;
+        })) {
+        Logger::error("render manager failed to initialize");
+        return false;
+    }
+    pass &= check(renderManager.isHookInstalled(), "Present hook installs");
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
+    swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (backBuffer != nullptr) {
+        device->CreateRenderTargetView(backBuffer.Get(), nullptr, &target);
+    }
+    if (target == nullptr) {
+        Logger::error("cannot create the render self-test target view");
+        DestroyWindow(window);
+        renderManager.shutdown();
+        return false;
+    }
+
+    // Staging texture + a RenderEvent subscriber that copies the backbuffer
+    // mid-frame (after the overlay was drawn, before the original Present),
+    // which is also the proof that RenderEvent fires from the hook.
+    D3D11_TEXTURE2D_DESC backDesc{};
+    backBuffer->GetDesc(&backDesc);
+
+    D3D11_TEXTURE2D_DESC stagingDesc = backDesc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+    device->CreateTexture2D(&stagingDesc, nullptr, &staging);
+
+    int renderEvents = 0;
+    const events::ScopedSubscription<RenderEvent> subscription{
+        events::EventBus::subscribe<RenderEvent>([&](const RenderEvent&) {
+            ++renderEvents;
+            if (staging != nullptr && backBuffer != nullptr) {
+                context->CopyResource(staging.Get(), backBuffer.Get());
+            }
+        })};
+
+    const float black[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int i = 0; i < 5; ++i) {
+        context->ClearRenderTargetView(target.Get(), black);
+        swapChain->Present(0, 0);
+    }
+
+    // 2. The hook intercepted every presented frame.
+    pass &= check(renderManager.presentedFrames() >= 5,
+                  "hooked Present intercepts every frame");
+    // 3. RenderEvent dispatched on each frame.
+    pass &= check(renderEvents >= 5, "RenderEvent dispatches on every frame");
+
+    // 4. Overlay pixels are visible: scan the staging copy for non-black
+    //    pixels inside the overlay box region.
+    bool overlayVisible = false;
+    if (staging != nullptr) {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            const auto* pixels = static_cast<const std::uint8_t*>(mapped.pData);
+            const std::size_t width = backDesc.Width;
+            const std::size_t height = backDesc.Height;
+            const std::size_t x0 = 12;
+            const std::size_t x1 = (std::min)(width, std::size_t{300});
+            const std::size_t y0 = 12;
+            const std::size_t y1 = (std::min)(height, std::size_t{28});
+            for (std::size_t y = y0; y < y1 && !overlayVisible; ++y) {
+                const std::uint8_t* row = pixels + y * mapped.RowPitch;
+                for (std::size_t x = x0; x < x1; ++x) {
+                    if (row[x * 4] > 40 || row[x * 4 + 1] > 40 || row[x * 4 + 2] > 40) {
+                        overlayVisible = true;
+                        break;
+                    }
+                }
+            }
+            context->Unmap(staging.Get(), 0);
+        }
+    }
+    pass &= check(overlayVisible, "overlay pixels are visible in the backbuffer");
+
+    // 5. FPS measurement: keep presenting for just over a second.
+    LARGE_INTEGER start{};
+    LARGE_INTEGER now{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    do {
+        context->ClearRenderTargetView(target.Get(), black);
+        swapChain->Present(0, 0);
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart - start.QuadPart < frequency.QuadPart + frequency.QuadPart / 10);
+    pass &= check(renderManager.presentedFrames() > 60 && renderManager.fps() > 0.f,
+                  "FPS is measured across a one second window");
+
+    // 6. Shutdown removes the hook; further presents bypass the manager.
+    renderManager.shutdown();
+    const std::uint64_t framesBefore = renderManager.presentedFrames();
+    context->ClearRenderTargetView(target.Get(), black);
+    swapChain->Present(0, 0);
+    pass &= check(!renderManager.isHookInstalled() &&
+                      renderManager.presentedFrames() == framesBefore,
+                  "Present hook uninstalls and stays inactive");
+
+    DestroyWindow(window);
+    UnregisterClassW(L"YuzoraRenderSelfTest", windowClass.hInstance);
+
+    Logger::info("Render self-test {}", pass ? "passed (6/6)" : "FAILED");
     return pass;
 }
 

@@ -1,8 +1,25 @@
 #include "Client.hpp"
 
+#include <format>
+#include <string>
+
 #include "Logger.hpp"
 #include "SelfTest.hpp"
 #include "events/EventBus.hpp"
+#include "rendering/RenderManager.hpp"
+#include "sdk/client/ClientInstance.hpp"
+#include "sdk/math/Vec3.hpp"
+
+namespace {
+
+// Client version baked in by CMake.
+#define YUZORA_STR2(value) #value
+#define YUZORA_STR(value) YUZORA_STR2(value)
+constexpr const char* kClientVersion =
+    "v" YUZORA_STR(YUZORA_VERSION_MAJOR) "." YUZORA_STR(YUZORA_VERSION_MINOR) "."
+    YUZORA_STR(YUZORA_VERSION_PATCH) "-dev";
+
+}  // namespace
 
 namespace yuzora {
 
@@ -55,6 +72,13 @@ bool Client::initialize() {
                      "foundation only)");
         hookManager_.installAll();
         hookManager_.logDiagnostics();
+
+        if (!renderManager_.initialize([this] { return buildOverlay(); })) {
+            Logger::error("render manager initialization failed; aborting initialization");
+            state_ = ClientState::Uninitialized;
+            return false;
+        }
+        Logger::info("Render hook installed - overlay should be visible on the game");
     } else {
         // Standalone (test loader) environment: validate the foundations on
         // our own module instead.
@@ -75,6 +99,11 @@ bool Client::initialize() {
         }
         if (!runSdkSelfTest(sdk_)) {
             Logger::error("sdk self-test failed; aborting initialization");
+            state_ = ClientState::Uninitialized;
+            return false;
+        }
+        if (!runRenderSelfTest(renderManager_)) {
+            Logger::error("render self-test failed; aborting initialization");
             state_ = ClientState::Uninitialized;
             return false;
         }
@@ -102,6 +131,7 @@ bool Client::shutdown() {
     }
 
     // Subsystems are shut down here, in reverse initialization order.
+    renderManager_.shutdown();
     hookManager_.uninstallAll();
     events::EventBus::clearAllSubscriptions();
     sdk_.shutdown();
@@ -116,6 +146,44 @@ bool Client::shutdown() {
 ClientState Client::state() const {
     const std::scoped_lock lock{mutex_};
     return state_;
+}
+
+rendering::OverlayInfo Client::buildOverlay() {
+    rendering::OverlayInfo info;
+    info.titleLine = std::format("YuzoraClient {} [{}]", kClientVersion,
+                                 versionManager_.isGameDetected() ? "game" : "standalone");
+
+    info.gameVersionLine = versionManager_.isGameDetected()
+                               ? std::format("Minecraft: {}", versionManager_.version().toString())
+                               : std::string("Minecraft: not detected");
+
+    // Position access goes through the SDK; until real signatures are
+    // resolved it honestly reports unavailable.
+    std::string coordinates = "XYZ: unavailable";
+    if (sdk_.isAvailable()) {
+        sdk::ClientInstance* const client = sdk_.getClientInstance();
+        sdk::LocalPlayer* const player =
+            (client != nullptr) ? client->getLocalPlayer() : nullptr;
+        if (player != nullptr) {
+            const sdk::Vec3 position = player->getPosition();
+            coordinates = std::format("XYZ: {:.1f} {:.1f} {:.1f}", position.x,
+                                      position.y, position.z);
+        }
+    }
+    info.coordinatesLine = coordinates;
+
+    const sdk::SdkFunctions& functions = sdk_.functions();
+    const unsigned sdkResolved =
+        static_cast<unsigned>(functions.getClientInstance != nullptr) +
+        static_cast<unsigned>(functions.getLocalPlayer != nullptr) +
+        static_cast<unsigned>(functions.getLevel != nullptr) +
+        static_cast<unsigned>(functions.getPosition != nullptr);
+
+    info.statusLine = std::format("Signatures: {}/{}  Hooks: {}/{}  SDK: {}/{}",
+                                  signatureManager_.resolvedCount(),
+                                  signatureManager_.count(), hookManager_.installedCount(),
+                                  hookManager_.count(), sdkResolved, 4u);
+    return info;
 }
 
 }  // namespace yuzora

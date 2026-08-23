@@ -34,6 +34,10 @@ public:
     // Uninstalls every hook in reverse registration order. Idempotent.
     bool uninstallAll();
 
+    // Uninstalls and removes one hook by name. Returns false when no hook
+    // with that name exists.
+    bool remove(std::string_view name);
+
     // Logs the diagnostics block:
     //   [OK] Name
     //   N / M hooks installed

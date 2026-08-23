@@ -2,6 +2,7 @@
 
 #include "hooks/HookManager.hpp"
 #include "memory/SignatureManager.hpp"
+#include "rendering/RenderManager.hpp"
 #include "sdk/Sdk.hpp"
 
 namespace yuzora {
@@ -38,5 +39,14 @@ namespace yuzora {
 //
 // Returns true when every check passed.
 [[nodiscard]] bool runSdkSelfTest(sdk::Sdk& sdk);
+
+// Validates the rendering foundation with a hidden D3D11 window created
+// inside this DLL: the Present hook installs, intercepts every presented
+// frame, draws overlay pixels that are verifiably visible in the
+// backbuffer, dispatches RenderEvent per frame, measures FPS, and
+// uninstalls cleanly. No game is involved.
+//
+// Returns true when every check passed.
+[[nodiscard]] bool runRenderSelfTest(rendering::RenderManager& renderManager);
 
 }  // namespace yuzora
