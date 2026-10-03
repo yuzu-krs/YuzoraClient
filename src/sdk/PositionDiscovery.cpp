@@ -122,6 +122,7 @@ void PositionDiscovery::threadProc() {
     std::vector<std::uint8_t> snapB;
 
     for (int pass = 1; pass <= kMaxPasses && running_.load(); ++pass) {
+        pass_.store(pass);
         std::size_t scanned = 0;
         for (const RegionRange& region : regions) {
             if (!running_.load()) {
@@ -188,6 +189,7 @@ void PositionDiscovery::threadProc() {
             }
         }
         firstPass = false;
+        candidates_.store(candidates.size());
 
         Logger::info("[esp] pass {} done: scanned {:.1f} MB, {} candidate(s)",
                      pass, static_cast<double>(scanned) / (1024.0 * 1024.0),
@@ -270,6 +272,19 @@ void PositionDiscovery::threadProc() {
     Logger::info("[esp] discovery complete - position tracking live");
 }
 
+std::string PositionDiscovery::statusText() const {
+    if (found_.load()) {
+        return "ESP: position locked";
+    }
+    const int pass = pass_.load();
+    if (pass == 0) {
+        return "ESP scan: starting...";
+    }
+    return "ESP scan: pass " + std::to_string(pass) + "/" +
+           std::to_string(kMaxPasses) + ", " +
+           std::to_string(candidates_.load()) + " candidates - keep walking";
+}
+
 bool PositionDiscovery::start() {
     if (running_.exchange(true)) {
         return true;
@@ -278,6 +293,8 @@ bool PositionDiscovery::start() {
     positionAddress_.store(0);
     objectAddress_.store(0);
     vftableAddress_.store(0);
+    pass_.store(0);
+    candidates_.store(0);
     thread_ = std::thread(&PositionDiscovery::threadProc, this);
     return true;
 }

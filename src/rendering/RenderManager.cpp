@@ -352,16 +352,23 @@ void executeCommandListsHook(ID3D12CommandQueue* queue, UINT numCommandLists,
 
 }  // namespace
 
-bool RenderManager::initialize(OverlayProvider provider) {
+bool RenderManager::initialize(OverlayProvider provider,
+                               std::function<std::string()> statusProvider) {
     shutdown();
 
     provider_ = std::move(provider);
+    statusProvider_ = std::move(statusProvider);
 
     // The external overlay is the crash-safe visibility path: it never
     // touches the game's rendering, so hosts whose runtime denies foreign
     // D3D12 submissions (Minecraft's composition/UI swap chains) cannot be
     // disturbed by it.
-    externalOverlay_.start(provider_, [this] { return fps_; });
+    externalOverlay_.start(provider_, [this] { return fps_; },
+                           [this] {
+                               return statusProvider_
+                                          ? statusProvider_()
+                                          : std::string{};
+                           });
 
     // Throwaway window + device + swap chains: only the vtables are needed.
     // Two probe swap chains are created so that both dxgi swap chain
@@ -629,6 +636,7 @@ void RenderManager::shutdown() {
 
     hookInstalled_ = false;
     firstDrawLogged_ = false;
+    statusProvider_ = nullptr;
     {
         const std::scoped_lock mapLock{g_queueMapMutex};
         g_queueToDevice.clear();

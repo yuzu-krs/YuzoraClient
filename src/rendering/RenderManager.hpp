@@ -34,7 +34,9 @@ public:
     RenderManager(const RenderManager&) = delete;
     RenderManager& operator=(const RenderManager&) = delete;
 
-    [[nodiscard]] bool initialize(OverlayProvider provider);
+    [[nodiscard]] bool initialize(
+        OverlayProvider provider,
+        std::function<std::string()> statusProvider = {});
     void shutdown();
 
     [[nodiscard]] bool isHookInstalled() const noexcept { return hookInstalled_; }
@@ -60,6 +62,7 @@ private:
     friend DWORD guardedDraw(RenderManager* manager, IDXGISwapChain* swapChain);
 
     OverlayProvider provider_;
+    std::function<std::string()> statusProvider_;
 
     bool hookInstalled_ = false;
     bool firstDrawLogged_ = false;

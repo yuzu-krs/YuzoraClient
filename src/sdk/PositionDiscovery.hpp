@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -38,6 +39,10 @@ public:
     // keeps reading the live address.
     [[nodiscard]] bool getPosition(Vec3& out) const;
 
+    // One-line status for overlays ("scan pass 2/10, 1423 candidates" /
+    // "position locked" / "idle").
+    [[nodiscard]] std::string statusText() const;
+
     // Backtracked containing-object info (valid after discovery).
     [[nodiscard]] std::uintptr_t positionAddress() const noexcept {
         return positionAddress_.load();
@@ -61,6 +66,8 @@ private:
     std::atomic<std::uintptr_t> positionAddress_{0};
     std::atomic<std::uintptr_t> objectAddress_{0};
     std::atomic<std::uintptr_t> vftableAddress_{0};
+    std::atomic<int> pass_{0};
+    std::atomic<std::size_t> candidates_{0};
     std::thread thread_;
 };
 

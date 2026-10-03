@@ -22,6 +22,7 @@ class ExternalOverlay {
 public:
     using InfoProvider = std::function<OverlayInfo()>;
     using FpsProvider = std::function<float()>;
+    using StatusProvider = std::function<std::string()>;
 
     ExternalOverlay() = default;
     ~ExternalOverlay() = default;
@@ -31,7 +32,8 @@ public:
 
     // Starts the overlay thread. The callbacks are invoked on the overlay
     // thread roughly every 100 ms.
-    bool start(InfoProvider infoProvider, FpsProvider fpsProvider);
+    bool start(InfoProvider infoProvider, FpsProvider fpsProvider,
+               StatusProvider statusProvider = {});
 
     // Signals the thread and waits for it to finish. Call before any state
     // the info callback reads is torn down.
@@ -49,6 +51,7 @@ private:
 
     InfoProvider infoProvider_;
     FpsProvider fpsProvider_;
+    StatusProvider statusProvider_;
 
     std::atomic<bool> running_{false};
     HANDLE thread_ = nullptr;

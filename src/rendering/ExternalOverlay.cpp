@@ -25,12 +25,14 @@ constexpr wchar_t kFallbackTitlePrefix[] = L"Minecraft";
 
 }  // namespace
 
-bool ExternalOverlay::start(InfoProvider infoProvider, FpsProvider fpsProvider) {
+bool ExternalOverlay::start(InfoProvider infoProvider, FpsProvider fpsProvider,
+                            StatusProvider statusProvider) {
     if (running_.load()) {
         return true;
     }
     infoProvider_ = std::move(infoProvider);
     fpsProvider_ = std::move(fpsProvider);
+    statusProvider_ = std::move(statusProvider);
 
     running_.store(true);
     thread_ = CreateThread(nullptr, 0, threadProcStatic, this, 0, &threadId_);
@@ -212,6 +214,12 @@ void ExternalOverlay::draw(HDC target, int width, int height) {
         TextOutA(target, static_cast<int>(padding), static_cast<int>(y),
                  line.c_str(), static_cast<int>(line.size()));
         y += lineStep;
+    }
+    if (statusProvider_) {
+        SetTextColor(target, RGB(160, 200, 255));
+        const std::string status = statusProvider_();
+        TextOutA(target, static_cast<int>(padding), static_cast<int>(y),
+                 status.c_str(), static_cast<int>(status.size()));
     }
     SelectObject(target, oldFont);
 }

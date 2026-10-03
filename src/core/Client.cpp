@@ -148,7 +148,9 @@ bool Client::initialize() {
         hookManager_.installAll();
         hookManager_.logDiagnostics();
 
-        if (!renderManager_.initialize([this] { return buildOverlay(); })) {
+        if (!renderManager_.initialize(
+                [this] { return buildOverlay(); },
+                [this] { return positionDiscovery_.statusText(); })) {
             Logger::error("render manager initialization failed; aborting initialization");
             state_ = ClientState::Uninitialized;
             return false;
