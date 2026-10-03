@@ -84,6 +84,18 @@ bool movedPlausibly(const SnapshotValue& a, const SnapshotValue& b) {
            dz < 100.f;
 }
 
+// SEH-guarded copy: the game frees/decommits memory concurrently, so a
+// region validated moments ago can fault mid-copy. Must stay a free
+// function without C++ unwinding objects.
+bool safeCopy(void* destination, const void* source, std::size_t size) {
+    __try {
+        std::memcpy(destination, source, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 SnapshotValue readTriple(std::uintptr_t address) {
     SnapshotValue v{};
     std::memcpy(&v, reinterpret_cast<const void*>(address), sizeof(v));
@@ -95,12 +107,15 @@ SnapshotValue readTriple(std::uintptr_t address) {
 void PositionDiscovery::threadProc() {
     Logger::info("[esp] position discovery started - join a world and walk");
 
+    // Declared outside the try so the result extraction below the catch
+    // handlers can read it.
+    std::unordered_map<std::uintptr_t, SnapshotValue> candidates;
+
+    try {
     const auto regions = collectRegions();
     Logger::info("[esp] scanning {} writable private region(s)",
                  regions.size());
 
-    // Global candidate list: address -> last seen triple.
-    std::unordered_map<std::uintptr_t, SnapshotValue> candidates;
     bool firstPass = true;
 
     std::vector<std::uint8_t> snapA;
@@ -125,8 +140,10 @@ void PositionDiscovery::threadProc() {
                 }
 
                 snapA.resize(sliceSize);
-                std::memcpy(snapA.data(), reinterpret_cast<const void*>(sliceBase),
-                            sliceSize);
+                if (!safeCopy(snapA.data(), reinterpret_cast<const void*>(sliceBase),
+                              sliceSize)) {
+                    continue;  // region freed/decommitted mid-scan
+                }
                 Sleep(300);
                 if (!running_.load()) {
                     return;
@@ -135,8 +152,10 @@ void PositionDiscovery::threadProc() {
                     continue;
                 }
                 snapB.resize(sliceSize);
-                std::memcpy(snapB.data(), reinterpret_cast<const void*>(sliceBase),
-                            sliceSize);
+                if (!safeCopy(snapB.data(), reinterpret_cast<const void*>(sliceBase),
+                              sliceSize)) {
+                    continue;
+                }
                 scanned += sliceSize;
 
                 const std::size_t floatSlots = sliceSize / 4;
@@ -187,8 +206,14 @@ void PositionDiscovery::threadProc() {
             Sleep(100);
         }
     }
+    } catch (const std::exception& e) {
+        Logger::error("[esp] discovery thread exception: {}", e.what());
+    } catch (...) {
+        Logger::error("[esp] discovery thread unknown exception");
+    }
 
     if (candidates.empty()) {
+        Logger::info("[esp] discovery ended with no result");
         return;
     }
 
