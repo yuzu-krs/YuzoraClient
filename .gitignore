@@ -10,3 +10,11 @@ out/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
+
+# Local diagnostics
+/DebugView/
+*.old
+yuzora*.log
+d3d11-overlay-dump.bmp
+d3d12-overlay-dump.bmp
+d3d12-atlas-dump.bmp

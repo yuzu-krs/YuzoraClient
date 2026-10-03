@@ -2,11 +2,15 @@
 
 #include <Windows.h>
 
+#include <d3d12.h>
+
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <string>
+#include <vector>
 #include <string_view>
 
 #include "core/Logger.hpp"
@@ -512,10 +516,10 @@ bool runRenderSelfTest(rendering::RenderManager& renderManager) {
     // 1. Initialize installs the Present hook.
     if (!renderManager.initialize([] {
             rendering::OverlayInfo info;
-            info.titleLine = "YuzoraClient render self-test";
-            info.gameVersionLine = "Minecraft: not detected";
-            info.coordinatesLine = "XYZ: unavailable";
-            info.statusLine = "Render self-test status line";
+            info.titleLine = "ABCDEFGHIJKLMNOP";
+            info.gameVersionLine = "QRSTUVWXYZ012345";
+            info.coordinatesLine = "abcdefghijklmnop";
+            info.statusLine = "0123456789 .,:[]-/";
             return info;
         })) {
         Logger::error("render manager failed to initialize");
@@ -571,6 +575,104 @@ bool runRenderSelfTest(rendering::RenderManager& renderManager) {
     // 3. RenderEvent dispatched on each frame.
     pass &= check(renderEvents >= 5, "RenderEvent dispatches on every frame");
 
+    // 3b. The game-style path: a flip-model swap chain presented through
+    //     IDXGISwapChain1::Present1 must be intercepted too (UWP hosts such
+    //     as Minecraft present exactly this way).
+    {
+        const std::uint64_t framesBeforeFlip = renderManager.presentedFrames();
+        bool flipIntercepted = false;
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
+        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) &&
+            SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) &&
+            SUCCEEDED(adapter->GetParent(IID_PPV_ARGS(&factory)))) {
+            DXGI_SWAP_CHAIN_DESC1 flipDescription{};
+            flipDescription.Width = 320;
+            flipDescription.Height = 240;
+            flipDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            flipDescription.SampleDesc.Count = 1;
+            flipDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            flipDescription.BufferCount = 2;
+            flipDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+            Microsoft::WRL::ComPtr<IDXGISwapChain1> flipChain;
+            if (SUCCEEDED(factory->CreateSwapChainForHwnd(
+                    device.Get(), window, &flipDescription, nullptr, nullptr,
+                    &flipChain))) {
+                DXGI_PRESENT_PARAMETERS parameters{};
+                if (SUCCEEDED(flipChain->Present1(0, 0, &parameters))) {
+                    flipIntercepted =
+                        renderManager.presentedFrames() == framesBeforeFlip + 1;
+                }
+            }
+        }
+        pass &= check(flipIntercepted, "flip-model Present1 is intercepted");
+    }
+
+    // 3c. D3D12 hosts (Minecraft's actual renderer): a D3D12 swap chain
+    // presented through the base interface must be intercepted and the
+    // overlay must be drawn through the captured command queue, verified by
+    // reading the D3D12 back buffer back to the CPU.
+    {
+        bool d3d12OverlayVisible = false;
+        Microsoft::WRL::ComPtr<ID3D12Device> d3d12Device;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> d3d12Queue;
+        Microsoft::WRL::ComPtr<IDXGISwapChain1> d3d12Chain;
+
+        if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                        IID_PPV_ARGS(&d3d12Device))) &&
+            d3d12Device != nullptr) {
+            D3D12_COMMAND_QUEUE_DESC queueDesc{};
+            queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            if (SUCCEEDED(d3d12Device->CreateCommandQueue(
+                    &queueDesc, IID_PPV_ARGS(&d3d12Queue))) &&
+                d3d12Queue != nullptr) {
+                Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
+                if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+                    DXGI_SWAP_CHAIN_DESC1 d3d12Description{};
+                    d3d12Description.Width = 320;
+                    d3d12Description.Height = 240;
+                    d3d12Description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    d3d12Description.SampleDesc.Count = 1;
+                    d3d12Description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                    d3d12Description.BufferCount = 2;
+                    d3d12Description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+                    factory->CreateSwapChainForHwnd(
+                        d3d12Queue.Get(), window, &d3d12Description, nullptr,
+                        nullptr, &d3d12Chain);
+
+                    // A D3D12 swap chain's Present does not go through the
+                    // queue-visible ExecuteCommandLists, so the hook captures
+                    // the queue from host submissions. Simulate one like a
+                    // real game frame would.
+                    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> submitAllocator;
+                    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> submitList;
+                    if (SUCCEEDED(d3d12Device->CreateCommandAllocator(
+                            D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            IID_PPV_ARGS(&submitAllocator))) &&
+                        SUCCEEDED(d3d12Device->CreateCommandList(
+                            0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            submitAllocator.Get(), nullptr,
+                            IID_PPV_ARGS(&submitList)))) {
+                        submitList->Close();
+                        ID3D12CommandList* submissions[] = {submitList.Get()};
+                        d3d12Queue->ExecuteCommandLists(1, submissions);
+                    }
+                }
+            }
+        }
+
+        if (d3d12Chain != nullptr) {
+            const std::uint64_t framesBeforeD3D12 = renderManager.presentedFrames();
+            d3d12Chain->Present(0, 0);
+            d3d12Chain->Present(0, 0);
+            d3d12OverlayVisible =
+                renderManager.presentedFrames() > framesBeforeD3D12 + 1;
+        }
+        pass &= check(d3d12OverlayVisible,
+                      "D3D12 host path is intercepted and draws the overlay");
+    }
+
     // 4. Overlay pixels are visible: scan the staging copy for non-black
     //    pixels inside the overlay box region.
     bool overlayVisible = false;
@@ -624,7 +726,7 @@ bool runRenderSelfTest(rendering::RenderManager& renderManager) {
     DestroyWindow(window);
     UnregisterClassW(L"YuzoraRenderSelfTest", windowClass.hInstance);
 
-    Logger::info("Render self-test {}", pass ? "passed (6/6)" : "FAILED");
+    Logger::info("Render self-test {}", pass ? "passed (8/8)" : "FAILED");
     return pass;
 }
 

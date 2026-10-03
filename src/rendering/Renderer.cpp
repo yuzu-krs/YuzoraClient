@@ -5,58 +5,15 @@
 #include <cstring>
 
 #include "core/Logger.hpp"
+#include "rendering/Shaders.hpp"
 
 namespace yuzora::rendering {
 
 namespace {
 
-// Positions arrive in pixels; the vertex shader maps them to clip space.
-constexpr char kVertexShader[] = R"(
-cbuffer Screen : register(b0) {
-    float4 screenSize;  // xy = width/height; zw reserved (16-byte cbuffer rule)
-};
-struct VSIn {
-    float2 pos : POSITION;
-    float2 uv : TEXCOORD;
-    float4 color : COLOR;
-};
-struct VSOut {
-    float4 pos : SV_POSITION;
-    float2 uv : TEXCOORD;
-    float4 color : COLOR;
-};
-VSOut main(VSIn input) {
-    VSOut output;
-    output.pos = float4(
-        input.pos.x / screenSize.x * 2.0 - 1.0,
-        1.0 - input.pos.y / screenSize.y * 2.0,
-        0.0, 1.0);
-    output.uv = input.uv;
-    output.color = input.color;
-    return output;
-}
-)";
-
-constexpr char kPixelShader[] = R"(
-Texture2D atlas : register(t0);
-SamplerState samplerState : register(s0);
-struct PSIn {
-    float4 pos : SV_POSITION;
-    float2 uv : TEXCOORD;
-    float4 color : COLOR;
-};
-float4 main(PSIn input) : SV_Target {
-    float4 texel = atlas.Sample(samplerState, input.uv);
-    return texel * input.color;
-}
-)";
-
-// Constant buffers must be a multiple of 16 bytes.
-struct ScreenSize {
-    float width;
-    float height;
-    float reserved[2];
-};
+using shaders::kPixelShader;
+using shaders::kVertexShader;
+using shaders::ScreenSize;
 
 }  // namespace
 
@@ -161,30 +118,15 @@ bool Renderer::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
         return false;
     }
 
-    // Atlas + one extra solid-white column appended for filled rects.
-    const std::size_t solidX = font_.width();
-    const std::size_t atlasWidth =
-        font_.width() + static_cast<std::size_t>(font_.glyph(' ').width);
-    std::vector<std::uint8_t> atlas(atlasWidth * font_.height() * 4, 0);
-    std::memcpy(atlas.data(), font_.rgba(), font_.width() * font_.height() * 4);
-    const float cellW = font_.glyph(' ').width;
-    const float cellH = font_.glyph(' ').height;
-    for (std::size_t y = 0; y < font_.height(); ++y) {
-        for (std::size_t x = 0; x < static_cast<std::size_t>(cellW); ++x) {
-            const std::size_t index = (y * atlasWidth + solidX + x) * 4;
-            atlas[index + 0] = 255;
-            atlas[index + 1] = 255;
-            atlas[index + 2] = 255;
-            atlas[index + 3] = 255;
-        }
-    }
-    solidU0_ = static_cast<float>(solidX) / static_cast<float>(atlasWidth);
-    solidV0_ = 0.f;
-    solidU1_ = static_cast<float>(solidX + cellW) / static_cast<float>(atlasWidth);
-    solidV1_ = cellH / static_cast<float>(font_.height());
+    // Atlas: glyphs plus the appended solid-white column (filled rects
+    // sample it); glyph UVs are already normalized against this width.
+    solidU0_ = font_.solidU0();
+    solidV0_ = font_.solidV0();
+    solidU1_ = font_.solidU1();
+    solidV1_ = font_.solidV1();
 
     D3D11_TEXTURE2D_DESC texture{};
-    texture.Width = static_cast<UINT>(atlasWidth);
+    texture.Width = static_cast<UINT>(font_.width());
     texture.Height = static_cast<UINT>(font_.height());
     texture.MipLevels = 1;
     texture.ArraySize = 1;
@@ -194,8 +136,8 @@ bool Renderer::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
     texture.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
     D3D11_SUBRESOURCE_DATA initData{};
-    initData.pSysMem = atlas.data();
-    initData.SysMemPitch = static_cast<UINT>(atlasWidth * 4);
+    initData.pSysMem = font_.rgba();
+    initData.SysMemPitch = static_cast<UINT>(font_.width() * 4);
 
     ComPtr<ID3D11Texture2D> atlasTexture;
     if (FAILED(device->CreateTexture2D(&texture, &initData, &atlasTexture)) ||

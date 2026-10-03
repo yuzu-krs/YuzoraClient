@@ -39,7 +39,9 @@ add_library(YuzoraClient SHARED
     src/memory/Scanner.cpp
     src/memory/Signature.cpp
     src/memory/SignatureManager.cpp
+    src/rendering/ExternalOverlay.cpp
     src/rendering/Font.cpp
+    src/rendering/D3D12Renderer.cpp
     src/rendering/RenderManager.cpp
     src/rendering/Renderer.cpp
     src/sdk/Sdk.cpp
@@ -49,6 +51,7 @@ add_library(YuzoraClient SHARED
 
 target_link_libraries(YuzoraClient PRIVATE
     d3d11
+    d3d12
     dxgi
     d3dcompiler
     gdi32
@@ -63,6 +66,11 @@ target_compile_definitions(YuzoraClient PRIVATE
 
 target_include_directories(YuzoraClient PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# Linker map for crash-address resolution while debugging on unknown hosts.
+target_link_options(YuzoraClient PRIVATE
+    "$<$<CONFIG:Debug>:/MAP:$<TARGET_FILE_DIR:YuzoraClient>/YuzoraClient.map>"
 )
 
 target_compile_definitions(YuzoraClient PRIVATE

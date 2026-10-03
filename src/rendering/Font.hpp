@@ -7,9 +7,12 @@
 namespace yuzora::rendering {
 
 // Rasterizes the ASCII range into a white-on-transparent atlas using GDI,
-// so no font data is embedded and no external library is needed. The
-// renderer uploads the pixels to a D3D11 texture and tints glyphs with a
-// per-vertex color.
+// so no font data is embedded and no external library is needed. One solid
+// white cell is appended after the glyph cells: filled rectangles sample
+// it, text samples the glyphs. Glyph UVs are normalized against the FINAL
+// atlas width (including the solid cell), so the renderers can upload
+// pixels_ as-is. The RGB channels are white everywhere and the glyph shape
+// lives in the alpha channel.
 class FontAtlas {
 public:
     struct Glyph {
@@ -31,6 +34,12 @@ public:
     [[nodiscard]] std::size_t height() const noexcept { return height_; }
     [[nodiscard]] float cellHeight() const noexcept { return cellHeight_; }
 
+    // Atlas UVs of the appended solid white cell (for filled rectangles).
+    [[nodiscard]] float solidU0() const noexcept { return solidU0_; }
+    [[nodiscard]] float solidV0() const noexcept { return solidV0_; }
+    [[nodiscard]] float solidU1() const noexcept { return solidU1_; }
+    [[nodiscard]] float solidV1() const noexcept { return solidV1_; }
+
     static constexpr char kFirstChar = ' ';
     static constexpr char kLastChar = '~';
     static constexpr std::size_t kGlyphCount = kLastChar - kFirstChar + 1;
@@ -42,6 +51,10 @@ private:
     std::size_t height_ = 0;
     float cellHeight_ = 0.f;
     float advance_ = 0.f;
+    float solidU0_ = 0.f;
+    float solidV0_ = 0.f;
+    float solidU1_ = 0.f;
+    float solidV1_ = 0.f;
 };
 
 }  // namespace yuzora::rendering

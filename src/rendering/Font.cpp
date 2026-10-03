@@ -30,7 +30,7 @@ bool FontAtlas::build(int cellHeight) {
     // Measure one cell first so the atlas fits the widest glyph.
     const HFONT measuringFont = CreateFontW(
         cellHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
         DEFAULT_PITCH | FF_MODERN, L"Consolas");
     if (measuringFont == nullptr) {
         DeleteDC(dc);
@@ -102,7 +102,34 @@ bool FontAtlas::build(int cellHeight) {
                 pixels_[dstIndex + 3] = alpha;
             }
         }
+    }
 
+    // Append one solid white cell at the right edge (filled rectangles
+    // sample it). The atlas width grows here: every existing row must be
+    // moved to the new (wider) stride, bottom-up so rows don't overwrite
+    // each other, and the glyph UVs below are computed against this FINAL
+    // width so they match the uploaded texture.
+    const std::size_t oldWidth = width_;
+    width_ += cellWidth;
+    pixels_.resize(width_ * height_ * 4, 0);
+    for (std::size_t y = height_; y > 0; --y) {
+        std::memmove(pixels_.data() + (y - 1) * width_ * 4,
+                     pixels_.data() + (y - 1) * oldWidth * 4, oldWidth * 4);
+    }
+    const std::size_t solidX = oldWidth;
+    for (std::size_t y = 0; y < cellH; ++y) {
+        for (std::size_t x = 0; x < cellWidth; ++x) {
+            const std::size_t index = (y * width_ + solidX + x) * 4;
+            pixels_[index + 0] = 255;
+            pixels_[index + 1] = 255;
+            pixels_[index + 2] = 255;
+            pixels_[index + 3] = 255;
+        }
+    }
+
+    for (std::size_t i = 0; i < kGlyphCount; ++i) {
+        const std::size_t atlasX = (i % kColumns) * cellWidth;
+        const std::size_t atlasY = (i / kColumns) * cellH;
         glyphs_[i].u0 = static_cast<float>(atlasX) / static_cast<float>(width_);
         glyphs_[i].v0 = static_cast<float>(atlasY) / static_cast<float>(height_);
         glyphs_[i].u1 = static_cast<float>(atlasX + cellWidth) / static_cast<float>(width_);
@@ -110,6 +137,10 @@ bool FontAtlas::build(int cellHeight) {
         glyphs_[i].width = static_cast<float>(cellWidth);
         glyphs_[i].height = static_cast<float>(cellH);
     }
+    solidU0_ = static_cast<float>(solidX) / static_cast<float>(width_);
+    solidV0_ = 0.f;
+    solidU1_ = static_cast<float>(solidX + cellWidth) / static_cast<float>(width_);
+    solidV1_ = static_cast<float>(cellH) / static_cast<float>(height_);
 
     DeleteObject(dib);
     DeleteObject(measuringFont);
