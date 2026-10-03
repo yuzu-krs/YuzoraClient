@@ -154,6 +154,11 @@ bool Client::initialize() {
             return false;
         }
         Logger::info("Render hook installed - overlay should be visible on the game");
+
+        // ESP-1 groundwork: discover the local player's position address by
+        // heap-delta scanning. Requires the player to be in a world and
+        // moving; results are logged and shown on the overlay.
+        positionDiscovery_.start();
     } else {
         // Standalone (test loader) environment: validate the foundations on
         // our own module instead.
@@ -206,6 +211,7 @@ bool Client::shutdown() {
     }
 
     // Subsystems are shut down here, in reverse initialization order.
+    positionDiscovery_.stop();
     renderManager_.shutdown();
     hookManager_.uninstallAll();
     events::EventBus::clearAllSubscriptions();
@@ -232,18 +238,27 @@ rendering::OverlayInfo Client::buildOverlay() {
                                ? std::format("Minecraft: {}", versionManager_.version().toString())
                                : std::string("Minecraft: not detected");
 
-    // Position access goes through the SDK; until real signatures are
-    // resolved it honestly reports unavailable.
+    // Position access: signature path first (when the SDK is resolved),
+    // then the runtime-discovered address (heap-delta scan).
     std::string coordinates = "XYZ: unavailable";
+    sdk::Vec3 position;
+    bool havePosition = false;
     if (sdk_.isAvailable()) {
         sdk::ClientInstance* const client = sdk_.getClientInstance();
         sdk::LocalPlayer* const player =
             (client != nullptr) ? client->getLocalPlayer() : nullptr;
         if (player != nullptr) {
-            const sdk::Vec3 position = player->getPosition();
-            coordinates = std::format("XYZ: {:.1f} {:.1f} {:.1f}", position.x,
-                                      position.y, position.z);
+            position = player->getPosition();
+            havePosition = true;
         }
+    }
+    if (!havePosition && positionDiscovery_.getPosition(position)) {
+        havePosition = true;  // live from the runtime-discovered address
+    }
+    if (havePosition) {
+        coordinates = std::format("XYZ: {:.1f} {:.1f} {:.1f}{}", position.x,
+                                  position.y, position.z,
+                                  sdk_.isAvailable() ? "" : "  (rt)");
     }
     info.coordinatesLine = coordinates;
 

@@ -37,6 +37,7 @@ add_library(YuzoraClient SHARED
     src/hooks/HookManager.cpp
     src/memory/Memory.cpp
     src/memory/Scanner.cpp
+    src/memory/RttiScanner.cpp
     src/memory/Signature.cpp
     src/memory/SignatureManager.cpp
     src/rendering/ExternalOverlay.cpp
@@ -44,6 +45,7 @@ add_library(YuzoraClient SHARED
     src/rendering/D3D12Renderer.cpp
     src/rendering/RenderManager.cpp
     src/rendering/Renderer.cpp
+    src/sdk/PositionDiscovery.cpp
     src/sdk/Sdk.cpp
     src/version/GameVersion.cpp
     src/version/VersionManager.cpp

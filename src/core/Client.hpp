@@ -5,6 +5,7 @@
 #include "hooks/HookManager.hpp"
 #include "memory/SignatureManager.hpp"
 #include "rendering/RenderManager.hpp"
+#include "sdk/PositionDiscovery.hpp"
 #include "sdk/Sdk.hpp"
 #include "version/VersionManager.hpp"
 
@@ -81,6 +82,7 @@ private:
     version::VersionManager versionManager_;
     memory::SignatureManager signatureManager_;
     sdk::Sdk sdk_;
+    sdk::PositionDiscovery positionDiscovery_;
     hooks::HookManager hookManager_;
     rendering::RenderManager renderManager_;
 

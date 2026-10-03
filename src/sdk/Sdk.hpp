@@ -1,10 +1,10 @@
 #pragma once
 
-#include <cstdint>
 #include <string_view>
 
 #include "sdk/SdkFunctions.hpp"
 #include "sdk/client/ClientInstance.hpp"
+#include "sdk/math/Vec3.hpp"
 
 namespace yuzora::memory {
 class SignatureManager;
