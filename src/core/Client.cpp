@@ -5,6 +5,7 @@
 
 #include "Logger.hpp"
 #include "SelfTest.hpp"
+#include "memory/Memory.hpp"
 #include "events/EventBus.hpp"
 #include "rendering/RenderManager.hpp"
 #include "sdk/client/ClientInstance.hpp"
@@ -18,6 +19,75 @@ namespace {
 constexpr const char* kClientVersion =
     "v" YUZORA_STR(YUZORA_VERSION_MAJOR) "." YUZORA_STR(YUZORA_VERSION_MINOR) "."
     YUZORA_STR(YUZORA_VERSION_PATCH) "-dev";
+
+// Parses the loaded game image's debug directory and logs the CodeView PDB
+// reference (name + GUID + age). Microsoft publishes Bedrock client PDBs on
+// its public symbol server, which would give exact class layouts for free.
+void logGamePdbInfo(std::uintptr_t moduleBase) {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(moduleBase);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return;
+    }
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        moduleBase + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return;
+    }
+    const auto& debugDir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    if (debugDir.Size == 0) {
+        yuzora::Logger::info("[pdb] game image has no debug directory");
+        return;
+    }
+    const auto* entries =
+        reinterpret_cast<const IMAGE_DEBUG_DIRECTORY*>(moduleBase +
+                                                       debugDir.VirtualAddress);
+    const std::size_t count = debugDir.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (entries[i].Type != IMAGE_DEBUG_TYPE_CODEVIEW) {
+            continue;
+        }
+        const auto* cv =
+            reinterpret_cast<const std::uint8_t*>(moduleBase +
+                                                  entries[i].AddressOfRawData);
+        if (cv == nullptr || std::memcmp(cv, "RSDS", 4) != 0) {
+            continue;
+        }
+        GUID guid{};
+        std::memcpy(&guid, cv + 4, sizeof(guid));
+        const std::uint32_t age =
+            *reinterpret_cast<const std::uint32_t*>(cv + 20);
+        const char* pdbName = reinterpret_cast<const char*>(cv + 24);
+
+        // Symbol-server GUID text: D1 as byte-swapped hex, D2/D3 as
+        // byte-swapped words, then Data4 in memory order.
+        const auto byte = [](std::uint8_t b) {
+            char buf[3] = {};
+            constexpr char kHex[] = "0123456789ABCDEF";
+            buf[0] = kHex[b >> 4];
+            buf[1] = kHex[b & 0xF];
+            return std::string(buf, 2);
+        };
+        const auto be16 = [](std::uint16_t v) {
+            return static_cast<std::uint16_t>((v >> 8) | ((v & 0xFF) << 8));
+        };
+        std::string guidText;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            guidText += byte(static_cast<std::uint8_t>(guid.Data1 >> shift));
+        }
+        guidText += byte(static_cast<std::uint8_t>(be16(guid.Data2) >> 8));
+        guidText += byte(static_cast<std::uint8_t>(be16(guid.Data2) & 0xFF));
+        guidText += byte(static_cast<std::uint8_t>(be16(guid.Data3) >> 8));
+        guidText += byte(static_cast<std::uint8_t>(be16(guid.Data3) & 0xFF));
+        for (int k = 0; k < 8; ++k) {
+            guidText += byte(guid.Data4[k]);
+        }
+
+        yuzora::Logger::info("[pdb] {} guid={} age={} | symbol server: https://"
+                             "msdl.microsoft.com/download/symbols",
+                             pdbName, guidText, age);
+    }
+}
 
 }  // namespace
 
@@ -62,8 +132,13 @@ bool Client::initialize() {
         // itself unavailable, which is expected and not an error.
         sdk_.resolveFromSignatures(signatureManager_);
         sdk_.logDiagnostics();
-        Logger::info("Production SDK functions: none resolvable yet (signatures "
-                     "pending reverse engineering)");
+
+        // Passive RTTI resolution groundwork (ESP / position access path).
+        if (const auto gameModule =
+                memory::getModule(versionManager_.gameModuleName())) {
+            (void)sdk_.resolveRuntime(*gameModule);
+            logGamePdbInfo(gameModule->base);
+        }
 
         // v0.3 scope: the hook foundation is verified by the standalone
         // self-test. No production Minecraft hooks are registered yet -

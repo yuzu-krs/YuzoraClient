@@ -3,6 +3,7 @@
 #include <iterator>
 
 #include "core/Logger.hpp"
+#include "memory/RttiScanner.hpp"
 #include "memory/SignatureManager.hpp"
 
 namespace yuzora::sdk {
@@ -26,6 +27,62 @@ void Sdk::resolveFromSignatures(const memory::SignatureManager& signatures) {
     if (const auto address = signatures.get(kSignatureGetPosition)) {
         functions_.getPosition = reinterpret_cast<Vec3 (*)(void*)>(*address);
     }
+}
+
+bool Sdk::resolveRuntime(const memory::ModuleInfo& gameModule) {
+    runtimeClientInstance_ = 0;
+    runtimeLocalPlayer_ = 0;
+
+    using memory::RttiScanner;
+
+    // Chain 1: ClientInstance - the singleton lives in the module's data.
+    const auto clientTd =
+        RttiScanner::findTypeDescriptor(gameModule, ".?AVClientInstance@@");
+    Logger::info("[rtti] ClientInstance type descriptor: 0x{:016X}", clientTd);
+    if (clientTd == 0) {
+        return false;
+    }
+    const auto clientVftables =
+        RttiScanner::findVftables(gameModule, clientTd);
+    Logger::info("[rtti] ClientInstance vftables: {}", clientVftables.size());
+    if (clientVftables.empty()) {
+        return false;
+    }
+    for (const auto& info : clientVftables) {
+        const auto instances =
+            RttiScanner::findInstances(gameModule, info.vftableAddress);
+        Logger::info("[rtti] ClientInstance vftable 0x{:016X} -> {} instance(s)",
+                     info.vftableAddress, instances.size());
+        if (!instances.empty()) {
+            runtimeClientInstance_ = instances.front();
+            break;
+        }
+    }
+    Logger::info("[rtti] ClientInstance @ 0x{:016X}", runtimeClientInstance_);
+    if (runtimeClientInstance_ == 0) {
+        return false;
+    }
+
+    // Chain 2: LocalPlayer - a member pointer inside ClientInstance whose
+    // target starts with the LocalPlayer vftable.
+    const auto playerTd =
+        RttiScanner::findTypeDescriptor(gameModule, ".?AVLocalPlayer@@");
+    if (playerTd == 0) {
+        Logger::info("[rtti] LocalPlayer type descriptor not found");
+        return false;
+    }
+    const auto playerVftables = RttiScanner::findVftables(gameModule, playerTd);
+    Logger::info("[rtti] LocalPlayer vftables: {}", playerVftables.size());
+    for (const auto& info : playerVftables) {
+        const auto member = RttiScanner::findMemberWithVftable(
+            runtimeClientInstance_, info.vftableAddress, 0x900);
+        if (member != 0) {
+            runtimeLocalPlayer_ = member;
+            break;
+        }
+    }
+    Logger::info("[rtti] LocalPlayer @ 0x{:016X}", runtimeLocalPlayer_);
+    return true;
 }
 
 void Sdk::shutdown() {

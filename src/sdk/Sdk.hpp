@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string_view>
 
 #include "sdk/SdkFunctions.hpp"
@@ -7,6 +8,8 @@
 
 namespace yuzora::memory {
 class SignatureManager;
+struct ModuleInfo;
+class RttiScanner;
 }
 
 namespace yuzora::sdk {
@@ -51,6 +54,20 @@ public:
     // above. Called by the Client in game mode.
     void resolveFromSignatures(const memory::SignatureManager& signatures);
 
+    // Passive RTTI-based discovery (no game functions called): resolves the
+    // client instance and local player raw addresses by class-name scanning
+    // through the game module. Update-resilient where byte signatures are
+    // not. Returns true when the client instance was found.
+    [[nodiscard]] bool resolveRuntime(const memory::ModuleInfo& gameModule);
+
+    // Passive-mode addresses (0 while unresolved).
+    [[nodiscard]] std::uintptr_t clientInstanceAddress() const noexcept {
+        return runtimeClientInstance_;
+    }
+    [[nodiscard]] std::uintptr_t localPlayerAddress() const noexcept {
+        return runtimeLocalPlayer_;
+    }
+
     // Clears the table; every accessor becomes unavailable.
     void shutdown();
 
@@ -71,6 +88,10 @@ public:
 private:
     SdkFunctions functions_{};
     ClientInstance clientInstance_{};  // re-wrapped on every access
+
+    // Passive RTTI-mode addresses.
+    std::uintptr_t runtimeClientInstance_ = 0;
+    std::uintptr_t runtimeLocalPlayer_ = 0;
 };
 
 }  // namespace yuzora::sdk
