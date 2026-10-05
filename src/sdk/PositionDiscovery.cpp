@@ -362,11 +362,10 @@ void PositionDiscovery::threadProc() {
                             } else {
                                 keep = stayedStill(a, b);
                             }
-                            if (!keep) {
-                                continue;
-                            }
                             if (firstPass) {
-                                candidates.emplace(address, b);
+                                if (keep) {
+                                    candidates.emplace(address, b);
+                                }
                                 continue;
                             }
                             // Narrowing: candidates failing the phase filter
@@ -375,8 +374,7 @@ void PositionDiscovery::threadProc() {
                             if (it == candidates.end()) {
                                 continue;
                             }
-                            const bool stillOk = stayedStill(a, b);
-                            if (stillOk) {
+                            if (keep) {
                                 it->second = b;
                             } else {
                                 candidates.erase(it);
