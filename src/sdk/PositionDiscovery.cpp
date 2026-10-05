@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -15,15 +16,28 @@ namespace yuzora::sdk {
 
 namespace {
 
-constexpr std::size_t kSliceSize = 32 * 1024 * 1024;  // 32 MB slices
-constexpr int kMaxPasses = 10;
+constexpr std::size_t kGroupBytes = 32 * 1024 * 1024;  // per-group snapshot cap
+constexpr int kMaxPasses = 16;                          // 8 walk/stop cycles
+constexpr int kWorkerThreads = 6;
+constexpr UINT kSettleMs = 1500;  // A/B window: clear movement or stillness
 
 struct RegionRange {
     std::uintptr_t base = 0;
     std::size_t size = 0;
 };
 
-bool isReadableWriteable(std::uintptr_t address) {
+struct Slice {
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+};
+
+// A scan group: slices totaling <= kGroupBytes, snapshotted with one sleep.
+struct ScanGroup {
+    std::vector<Slice> slices;
+    std::size_t totalSize = 0;
+};
+
+bool isWritablePrivate(std::uintptr_t address) {
     MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) == 0) {
         return false;
@@ -32,29 +46,31 @@ bool isReadableWriteable(std::uintptr_t address) {
         return false;
     }
     const DWORD protect = mbi.Protect & ~PAGE_GUARD;
-    return protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE;
+    return protect == PAGE_READWRITE;
 }
 
-// Writable private regions (heap) of this process, capped per region.
-std::vector<RegionRange> collectRegions() {
-    std::vector<RegionRange> regions;
-    std::uintptr_t address = 0;
+bool isReadableRange(std::uintptr_t address, [[maybe_unused]] std::size_t size) {
     MEMORY_BASIC_INFORMATION mbi{};
-    while (VirtualQuery(reinterpret_cast<void*>(address), &mbi,
-                        sizeof(mbi)) != 0) {
-        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
-            mbi.RegionSize >= 0x1000) {
-            const DWORD protect = mbi.Protect & ~PAGE_GUARD;
-            if (protect == PAGE_READWRITE) {
-                regions.push_back(
-                    {reinterpret_cast<std::uintptr_t>(mbi.BaseAddress),
-                     mbi.RegionSize});
-            }
-        }
-        address = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) +
-                  mbi.RegionSize;
+    if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) == 0) {
+        return false;
     }
-    return regions;
+    if (mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    const DWORD protect = mbi.Protect & ~PAGE_GUARD;
+    return protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READ ||
+           protect == PAGE_EXECUTE_READWRITE;
+}
+
+// SEH-guarded copy: the game frees/decommits memory concurrently, so a
+// validated range can fault mid-copy. Free function - no C++ unwinding.
+bool safeCopy(void* destination, const void* source, std::size_t size) {
+    __try {
+        std::memcpy(destination, source, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 struct SnapshotValue {
@@ -76,24 +92,16 @@ bool movedPlausibly(const SnapshotValue& a, const SnapshotValue& b) {
     const float dx = std::abs(b.x - a.x);
     const float dy = std::abs(b.y - a.y);
     const float dz = std::abs(b.z - a.z);
-    // A walking player moves ~0.05-2 per axis in 300 ms; the camera and
-    // physics also jitter values slightly. Anything teleported or static is
-    // filtered.
     const float moved = dx + dy + dz;
     return moved > 0.005f && moved < 400.f && dx < 100.f && dy < 100.f &&
            dz < 100.f;
 }
 
-// SEH-guarded copy: the game frees/decommits memory concurrently, so a
-// region validated moments ago can fault mid-copy. Must stay a free
-// function without C++ unwinding objects.
-bool safeCopy(void* destination, const void* source, std::size_t size) {
-    __try {
-        std::memcpy(destination, source, size);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+bool stayedStill(const SnapshotValue& a, const SnapshotValue& b) {
+    const float dx = std::abs(b.x - a.x);
+    const float dy = std::abs(b.y - a.y);
+    const float dz = std::abs(b.z - a.z);
+    return dx < 0.0005f && dy < 0.0005f && dz < 0.0005f;
 }
 
 SnapshotValue readTriple(std::uintptr_t address) {
@@ -102,175 +110,50 @@ SnapshotValue readTriple(std::uintptr_t address) {
     return v;
 }
 
-}  // namespace
+std::mutex g_candidatesMutex;
 
-void PositionDiscovery::threadProc() {
-    Logger::info("[esp] position discovery started - join a world and walk");
+// Packs writable private memory into scan groups (slices of big regions,
+// small regions batched together).
+std::vector<ScanGroup> buildScanGroups() {
+    std::vector<RegionRange> regions;
+    std::uintptr_t address = 0;
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) !=
+           0) {
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+            mbi.RegionSize >= 0x1000 && isWritablePrivate(
+            reinterpret_cast<std::uintptr_t>(mbi.BaseAddress))) {
+            regions.push_back(
+                {reinterpret_cast<std::uintptr_t>(mbi.BaseAddress),
+                 mbi.RegionSize});
+        }
+        address = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) +
+                  mbi.RegionSize;
+    }
 
-    // Declared outside the try so the result extraction below the catch
-    // handlers can read it.
-    std::unordered_map<std::uintptr_t, SnapshotValue> candidates;
-
-    try {
-    const auto regions = collectRegions();
-    Logger::info("[esp] scanning {} writable private region(s)",
-                 regions.size());
-
-    bool firstPass = true;
-
-    std::vector<std::uint8_t> snapA;
-    std::vector<std::uint8_t> snapB;
-
-    for (int pass = 1; pass <= kMaxPasses && running_.load(); ++pass) {
-        pass_.store(pass);
-        std::size_t scanned = 0;
-        for (const RegionRange& region : regions) {
-            if (!running_.load()) {
-                return;
-            }
-            for (std::size_t sliceOffset = 0;
-                 sliceOffset < region.size; sliceOffset += kSliceSize) {
-                if (!running_.load()) {
-                    return;
-                }
-                const std::uintptr_t sliceBase = region.base + sliceOffset;
-                const std::size_t sliceSize =
-                    (std::min)(kSliceSize, region.size - sliceOffset);
-                if (!isReadableWriteable(sliceBase)) {
-                    continue;
-                }
-
-                snapA.resize(sliceSize);
-                if (!safeCopy(snapA.data(), reinterpret_cast<const void*>(sliceBase),
-                              sliceSize)) {
-                    continue;  // region freed/decommitted mid-scan
-                }
-                Sleep(300);
-                if (!running_.load()) {
-                    return;
-                }
-                if (!isReadableWriteable(sliceBase)) {
-                    continue;
-                }
-                snapB.resize(sliceSize);
-                if (!safeCopy(snapB.data(), reinterpret_cast<const void*>(sliceBase),
-                              sliceSize)) {
-                    continue;
-                }
-                scanned += sliceSize;
-
-                const std::size_t floatSlots = sliceSize / 4;
-                const auto* fa = reinterpret_cast<const float*>(snapA.data());
-                const auto* fb = reinterpret_cast<const float*>(snapB.data());
-
-                for (std::size_t f = 0; f + 2 < floatSlots; ++f) {
-                    const SnapshotValue a{fa[f], fa[f + 1], fa[f + 2]};
-                    if (!plausibleCoords(a)) {
-                        continue;
-                    }
-                    const SnapshotValue b{fb[f], fb[f + 1], fb[f + 2]};
-                    if (!plausibleCoords(b) || !movedPlausibly(a, b)) {
-                        continue;
-                    }
-                    const std::uintptr_t address = sliceBase + f * 4;
-                    if (firstPass) {
-                        candidates.emplace(address, b);
-                    } else {
-                        const auto it = candidates.find(address);
-                        if (it != candidates.end()) {
-                            if (movedPlausibly(it->second, b)) {
-                                it->second = b;
-                            } else {
-                                candidates.erase(it);
-                            }
-                        }
-                    }
-                }
+    std::vector<ScanGroup> groups;
+    ScanGroup current;
+    for (const RegionRange& region : regions) {
+        std::uintptr_t offset = 0;
+        while (offset < region.size) {
+            const std::size_t take =
+                (std::min)(kGroupBytes - current.totalSize, region.size - offset);
+            current.slices.push_back({region.base + offset, take});
+            current.totalSize += take;
+            offset += take;
+            if (current.totalSize >= kGroupBytes) {
+                groups.push_back(std::move(current));
+                current = {};
             }
         }
-        firstPass = false;
-        candidates_.store(candidates.size());
-
-        Logger::info("[esp] pass {} done: scanned {:.1f} MB, {} candidate(s)",
-                     pass, static_cast<double>(scanned) / (1024.0 * 1024.0),
-                     candidates.size());
-
-        if (candidates.size() == 1) {
-            break;
-        }
-        if (candidates.empty()) {
-            Logger::error("[esp] no candidates remain - is the player in a "
-                          "world and moving?");
-            return;
-        }
-        // Give the player time to move before the next narrowing pass.
-        for (int wait = 0; wait < 30 && running_.load(); ++wait) {
-            Sleep(100);
-        }
     }
-    } catch (const std::exception& e) {
-        Logger::error("[esp] discovery thread exception: {}", e.what());
-    } catch (...) {
-        Logger::error("[esp] discovery thread unknown exception");
+    if (current.totalSize > 0) {
+        groups.push_back(std::move(current));
     }
-
-    if (candidates.empty()) {
-        Logger::info("[esp] discovery ended with no result");
-        return;
-    }
-
-    const auto& entry = *candidates.begin();
-    positionAddress_.store(entry.first);
-    found_.store(true);
-    Logger::info("[esp] position address discovered: 0x{:016X} "
-                 "({:.2f}, {:.2f}, {:.2f})",
-                 entry.first, entry.second.x, entry.second.y, entry.second.z);
-
-    // Backtrack to the containing object start: scan backwards for a qword
-    // that points into the game module's read-only data (a vftable).
-    const auto readable = [](std::uintptr_t address) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(reinterpret_cast<void*>(address), &mbi,
-                         sizeof(mbi)) == 0) {
-            return false;
-        }
-        return mbi.State == MEM_COMMIT;
-    };
-    std::uintptr_t objectStart = 0;
-    std::uintptr_t vftable = 0;
-    for (std::size_t back = 8; back <= 0x2000; back += 8) {
-        const std::uintptr_t candidateAddress = entry.first - back;
-        if (!readable(candidateAddress)) {
-            break;
-        }
-        const auto value = *reinterpret_cast<std::uintptr_t*>(candidateAddress);
-        if (value > 0x7FF000000000ULL || value < 0x10000) {
-            continue;
-        }
-        if (!readable(value)) {
-            continue;
-        }
-        // A vftable's first entry is a code pointer into the module.
-        const auto firstEntry = *reinterpret_cast<std::uintptr_t*>(value);
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(reinterpret_cast<void*>(value), &mbi, sizeof(mbi)) ==
-                0 ||
-            mbi.Type == MEM_PRIVATE) {
-            continue;
-        }
-        if (firstEntry > 0x7FF000000000ULL && readable(firstEntry)) {
-            objectStart = candidateAddress;
-            vftable = value;
-            break;
-        }
-    }
-    objectAddress_.store(objectStart);
-    vftableAddress_.store(vftable);
-    Logger::info("[esp] containing object 0x{:016X} vftable 0x{:016X} "
-                 "(delta {} bytes)",
-                 objectStart, vftable, entry.first - objectStart);
-    Logger::info("[esp] discovery complete - position tracking live");
+    return groups;
 }
+
+}  // namespace
 
 std::string PositionDiscovery::statusText() const {
     if (found_.load()) {
@@ -278,11 +161,13 @@ std::string PositionDiscovery::statusText() const {
     }
     const int pass = pass_.load();
     if (pass == 0) {
-        return "ESP scan: starting...";
+        return "ESP scan: enter a world";
     }
-    return "ESP scan: pass " + std::to_string(pass) + "/" +
-           std::to_string(kMaxPasses) + ", " +
-           std::to_string(candidates_.load()) + " candidates - keep walking";
+    // Odd passes: walk. Even passes: stand still.
+    const bool walk = (pass % 2) != 0;
+    return (walk ? "ESP: WALK now! (pass " : "ESP: STAND STILL (pass ") +
+           std::to_string(pass) + "/" + std::to_string(kMaxPasses) + "), " +
+           std::to_string(candidates_.load()) + " candidates";
 }
 
 bool PositionDiscovery::start() {
@@ -324,6 +209,241 @@ bool PositionDiscovery::getPosition(Vec3& out) const {
     }
     out = Vec3{v.x, v.y, v.z};
     return true;
+}
+
+void PositionDiscovery::threadProc() {
+    Logger::info("[esp] position discovery started - enter a world, then "
+                 "follow the WALK / STAND STILL prompts on the overlay");
+
+    // Declared outside the try so the result extraction after the catch
+    // handlers can read it.
+    std::unordered_map<std::uintptr_t, SnapshotValue> candidates;
+    std::mutex candidatesMutex;
+    bool firstPass = true;
+
+    try {
+        const auto groups = buildScanGroups();
+        std::size_t totalBytes = 0;
+        for (const auto& group : groups) {
+            totalBytes += group.totalSize;
+        }
+        Logger::info("[esp] {} scan group(s), {:.1f} MB total", groups.size(),
+                     static_cast<double>(totalBytes) / (1024.0 * 1024.0));
+        if (groups.empty()) {
+            return;
+        }
+
+        std::vector<std::uint8_t> snapA;
+        std::vector<std::uint8_t> snapB;
+
+        // Alternating WALK / STAND STILL phases: a real player position
+        // moves while walking and freezes EXACTLY while standing still;
+        // animations, timers and network values fail one of the two tests
+        // and are eliminated.
+        for (int pass = 1; pass <= kMaxPasses && running_.load(); ++pass) {
+            pass_.store(pass);
+            const bool walkPhase = (pass % 2) != 0;
+            std::atomic<std::size_t> nextGroup{0};
+
+            const auto worker = [&](int) {
+                std::size_t index = 0;
+                while (running_.load()) {
+                    index = nextGroup.fetch_add(1);
+                    if (index >= groups.size()) {
+                        break;
+                    }
+                    const ScanGroup& group = groups[index];
+
+                    std::vector<std::uint8_t> snapA(group.totalSize);
+                    std::vector<std::uint8_t> snapB(group.totalSize);
+
+                    std::size_t copied = 0;
+                    bool ok = true;
+                    for (const Slice& slice : group.slices) {
+                        if (!isReadableRange(slice.base, slice.size)) {
+                            ok = false;
+                            break;
+                        }
+                        if (!safeCopy(snapA.data() + copied,
+                                      reinterpret_cast<const void*>(slice.base),
+                                      slice.size)) {
+                            ok = false;
+                            break;
+                        }
+                        copied += slice.size;
+                    }
+                    if (!ok) {
+                        continue;
+                    }
+
+                    Sleep(kSettleMs);
+
+                    copied = 0;
+                    ok = true;
+                    for (const Slice& slice : group.slices) {
+                        if (!isReadableRange(slice.base, slice.size)) {
+                            ok = false;
+                            break;
+                        }
+                        if (!safeCopy(snapB.data() + copied,
+                                      reinterpret_cast<const void*>(slice.base),
+                                      slice.size)) {
+                            ok = false;
+                            break;
+                        }
+                        copied += slice.size;
+                    }
+                    if (!ok) {
+                        continue;
+                    }
+
+                    // Diff every slice in the group.
+                    std::size_t offset = 0;
+                    for (const Slice& slice : group.slices) {
+                        const std::size_t floatSlots = slice.size / 4;
+                        const auto* fa = reinterpret_cast<const float*>(
+                            snapA.data() + offset);
+                        const auto* fb = reinterpret_cast<const float*>(
+                            snapB.data() + offset);
+                        for (std::size_t f = 0; f + 2 < floatSlots; ++f) {
+                            const SnapshotValue a{fa[f], fa[f + 1], fa[f + 2]};
+                            if (!plausibleCoords(a)) {
+                                continue;
+                            }
+                            const SnapshotValue b{fb[f], fb[f + 1], fb[f + 2]};
+                            if (!plausibleCoords(b)) {
+                                continue;
+                            }
+                            const std::uintptr_t address =
+                                slice.base + offset + f * 4;
+                            const std::scoped_lock lock{g_candidatesMutex};
+                            if (firstPass) {
+                                candidates.emplace(address, b);
+                                continue;
+                            }
+                            // Narrowing: candidates failing the phase filter
+                            // are eliminated (this erase IS the algorithm).
+                            const auto it = candidates.find(address);
+                            if (it == candidates.end()) {
+                                continue;
+                            }
+                            const bool moved = movedPlausibly(a, b);
+                            bool keep;
+                            if (walkPhase) {
+                                keep = moved;
+                            } else {
+                                keep = stayedStill(a, b);
+                            }
+                            if (keep) {
+                                it->second = b;
+                            } else {
+                                candidates.erase(it);
+                            }
+                        }
+                        offset += slice.size;
+                    }
+                }
+            };
+
+            std::vector<std::thread> workers;
+            for (int w = 0; w < kWorkerThreads; ++w) {
+                workers.emplace_back(worker, w);
+            }
+            for (std::thread& t : workers) {
+                t.join();
+            }
+
+            firstPass = false;
+            candidates_.store(candidates.size());
+            Logger::info("[esp] pass {} ({}): {} candidate(s)", pass,
+                         walkPhase ? "WALK" : "STILL", candidates.size());
+
+            if (candidates.size() <= 1) {
+                break;
+            }
+            if (candidates.empty()) {
+                Logger::error("[esp] no candidates remain - was the player in "
+                              "a world following the prompts?");
+                return;
+            }
+        }
+
+        if (candidates.size() > 1) {
+            // Not converged: log the survivors for diagnosis instead of
+            // locking onto a probable false positive.
+            const std::scoped_lock lock{g_candidatesMutex};
+            int shown = 0;
+            for (const auto& [address, value] : candidates) {
+                Logger::info("[esp] candidate 0x{:016X} ({:.2f}, {:.2f}, {:.2f})",
+                             address, value.x, value.y, value.z);
+                if (++shown >= 8) {
+                    break;
+                }
+            }
+            Logger::error("[esp] not converged: {} candidates remain",
+                          candidates.size());
+            return;
+        }
+
+        const auto& entry = *candidates.begin();
+        positionAddress_.store(entry.first);
+        found_.store(true);
+        Logger::info("[esp] position address discovered: 0x{:016X} "
+                     "({:.2f}, {:.2f}, {:.2f})",
+                     entry.first, entry.second.x, entry.second.y, entry.second.z);
+
+        // Backtrack to the containing object start: scan backwards for a
+        // qword that points into the game module's read-only data (a
+        // vftable).
+        const auto readable = [](std::uintptr_t address) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &mbi,
+                             sizeof(mbi)) == 0) {
+                return false;
+            }
+            return mbi.State == MEM_COMMIT;
+        };
+        std::uintptr_t objectStart = 0;
+        std::uintptr_t vftable = 0;
+        for (std::size_t back = 8; back <= 0x2000; back += 8) {
+            const std::uintptr_t candidateAddress = entry.first - back;
+            if (!readable(candidateAddress)) {
+                break;
+            }
+            const auto value = *reinterpret_cast<std::uintptr_t*>(candidateAddress);
+            if (value > 0x7FF000000000ULL || value < 0x10000) {
+                continue;
+            }
+            if (!readable(value)) {
+                continue;
+            }
+            // A vftable's first entry is a code pointer into the module.
+            const auto firstEntry = *reinterpret_cast<std::uintptr_t*>(value);
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(value), &mbi, sizeof(mbi)) ==
+                    0 ||
+                mbi.Type == MEM_PRIVATE) {
+                continue;
+            }
+            if (firstEntry > 0x7FF000000000ULL && readable(firstEntry)) {
+                objectStart = candidateAddress;
+                vftable = value;
+                break;
+            }
+        }
+        objectAddress_.store(objectStart);
+        vftableAddress_.store(vftable);
+        if (objectStart != 0) {
+            Logger::info("[esp] containing object 0x{:016X} vftable 0x{:016X} "
+                         "(delta {} bytes)",
+                         objectStart, vftable, entry.first - objectStart);
+        }
+        Logger::info("[esp] discovery complete - position tracking live");
+    } catch (const std::exception& e) {
+        Logger::error("[esp] discovery thread exception: {}", e.what());
+    } catch (...) {
+        Logger::error("[esp] discovery thread unknown exception");
+    }
 }
 
 }  // namespace yuzora::sdk
