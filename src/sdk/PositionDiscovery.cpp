@@ -235,11 +235,13 @@ void PositionDiscovery::threadProc() {
 
         std::vector<std::uint8_t> snapA;
         std::vector<std::uint8_t> snapB;
+        std::vector<std::uint8_t> snapC;
 
-        // Alternating WALK / STAND STILL phases: a real player position
-        // moves while walking and freezes EXACTLY while standing still;
-        // animations, timers and network values fail one of the two tests
-        // and are eliminated.
+        // Alternating WALK / STAND STILL cycles. A real player position
+        // moves while walking, KEEPS THE SAME DIRECTION across consecutive
+        // windows (straight-line walking), and freezes EXACTLY while
+        // standing still. Animations, oscillators and timers fail the
+        // direction-consistency or freeze test and are eliminated.
         for (int pass = 1; pass <= kMaxPasses && running_.load(); ++pass) {
             pass_.store(pass);
             const bool walkPhase = (pass % 2) != 0;
@@ -256,6 +258,7 @@ void PositionDiscovery::threadProc() {
 
                     std::vector<std::uint8_t> snapA(group.totalSize);
                     std::vector<std::uint8_t> snapB(group.totalSize);
+                    std::vector<std::uint8_t> snapC(walkPhase ? group.totalSize : 0);
 
                     std::size_t copied = 0;
                     bool ok = true;
@@ -297,6 +300,30 @@ void PositionDiscovery::threadProc() {
                         continue;
                     }
 
+                    // Walk cycles take a third window for direction
+                    // consistency; still cycles compare A/B only.
+                    if (walkPhase) {
+                        Sleep(kSettleMs);
+                        copied = 0;
+                        ok = true;
+                        for (const Slice& slice : group.slices) {
+                            if (!isReadableRange(slice.base, slice.size)) {
+                                ok = false;
+                                break;
+                            }
+                            if (!safeCopy(snapC.data() + copied,
+                                          reinterpret_cast<const void*>(slice.base),
+                                          slice.size)) {
+                                ok = false;
+                                break;
+                            }
+                            copied += slice.size;
+                        }
+                        if (!ok) {
+                            continue;
+                        }
+                    }
+
                     // Diff every slice in the group.
                     std::size_t offset = 0;
                     for (const Slice& slice : group.slices) {
@@ -317,6 +344,27 @@ void PositionDiscovery::threadProc() {
                             const std::uintptr_t address =
                                 slice.base + offset + f * 4;
                             const std::scoped_lock lock{g_candidatesMutex};
+                            const bool moved = movedPlausibly(a, b);
+                            bool keep;
+                            if (walkPhase) {
+                                keep = moved;
+                                if (keep && !snapC.empty()) {
+                                    // Direction consistency: A->B and B->C
+                                    // must not flip sign on any axis.
+                                    const auto* fc = reinterpret_cast<const float*>(
+                                        snapC.data() + offset);
+                                    const SnapshotValue c{fc[f], fc[f + 1],
+                                                          fc[f + 2]};
+                                    keep = ((b.x - a.x) * (c.x - b.x) >= 0.f) &&
+                                           ((b.y - a.y) * (c.y - b.y) >= 0.f) &&
+                                           ((b.z - a.z) * (c.z - b.z) >= 0.f);
+                                }
+                            } else {
+                                keep = stayedStill(a, b);
+                            }
+                            if (!keep) {
+                                continue;
+                            }
                             if (firstPass) {
                                 candidates.emplace(address, b);
                                 continue;
@@ -327,14 +375,8 @@ void PositionDiscovery::threadProc() {
                             if (it == candidates.end()) {
                                 continue;
                             }
-                            const bool moved = movedPlausibly(a, b);
-                            bool keep;
-                            if (walkPhase) {
-                                keep = moved;
-                            } else {
-                                keep = stayedStill(a, b);
-                            }
-                            if (keep) {
+                            const bool stillOk = stayedStill(a, b);
+                            if (stillOk) {
                                 it->second = b;
                             } else {
                                 candidates.erase(it);
