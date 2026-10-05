@@ -99,7 +99,9 @@ bool movedPlausibly(const SnapshotValue& a, const SnapshotValue& b) {
     const float dy = std::abs(b.y - a.y);
     const float dz = std::abs(b.z - a.z);
     const float moved = dx + dy + dz;
-    return moved > 0.005f && moved < 400.f && dx < 100.f && dy < 100.f &&
+    // Walking covers ~6.5 m in a 1.5 s window; UI animations and small
+    // oscillators move far less. This threshold is what kills them.
+    return moved > 0.5f && moved < 400.f && dx < 100.f && dy < 100.f &&
            dz < 100.f;
 }
 
