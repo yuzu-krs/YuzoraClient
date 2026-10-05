@@ -21,6 +21,12 @@ constexpr int kMaxPasses = 16;                          // 8 walk/stop cycles
 constexpr int kWorkerThreads = 6;
 constexpr UINT kSettleMs = 1500;  // A/B window: clear movement or stillness
 
+// Persisted offsets (game-version keyed): written after a successful
+// discovery, read for instant position restore in later sessions.
+constexpr char kOffsetsCfg[] =
+    "C:\\Users\\yuzut\\AppData\\Local\\Packages\\"
+    "Microsoft.MinecraftUWP_8wekyb3d8bbwe\\LocalState\\yuzora-offsets.cfg";
+
 struct RegionRange {
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -170,7 +176,7 @@ std::string PositionDiscovery::statusText() const {
            std::to_string(candidates_.load()) + " candidates";
 }
 
-bool PositionDiscovery::start() {
+bool PositionDiscovery::start(std::uintptr_t gameModuleBase) {
     if (running_.exchange(true)) {
         return true;
     }
@@ -180,6 +186,77 @@ bool PositionDiscovery::start() {
     vftableAddress_.store(0);
     pass_.store(0);
     candidates_.store(0);
+    gameModuleBase_ = gameModuleBase;
+
+    // Fast path: restore previously discovered offsets. The vftable lives at
+    // a fixed module offset for a given game version, so any object whose
+    // first qword equals moduleBase + vftableModuleOffset is the player.
+    if (gameModuleBase != 0) {
+        std::FILE* cfg = nullptr;
+        if (fopen_s(&cfg, kOffsetsCfg, "r") == 0 && cfg != nullptr) {
+            unsigned long long vftableModuleOffset = 0;
+            unsigned long long posOffset = 0;
+            const bool parsed =
+                fscanf_s(cfg, "%llx %llx", &vftableModuleOffset,
+                         &posOffset) == 2;
+            std::fclose(cfg);
+            if (parsed && vftableModuleOffset > 0 && posOffset > 0) {
+                const std::uintptr_t vftableValue =
+                    gameModuleBase + vftableModuleOffset;
+                // Scan writable private memory for objects pointing at the
+                // vftable.
+                std::uintptr_t address = 0;
+                MEMORY_BASIC_INFORMATION mbi{};
+                bool found = false;
+                while (running_.load() &&
+                       VirtualQuery(reinterpret_cast<void*>(address), &mbi,
+                                    sizeof(mbi)) != 0) {
+                    if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+                        mbi.Protect == PAGE_READWRITE && mbi.RegionSize >= 8) {
+                        const auto* qwords =
+                            reinterpret_cast<const std::uintptr_t*>(
+                                mbi.BaseAddress);
+                        const std::size_t qwordsCount = mbi.RegionSize / 8;
+                        for (std::size_t i = 0; i < qwordsCount; ++i) {
+                            if (qwords[i] != vftableValue) {
+                                continue;
+                            }
+                            const std::uintptr_t object =
+                                reinterpret_cast<std::uintptr_t>(
+                                    mbi.BaseAddress) + i * 8;
+                            const std::uintptr_t position =
+                                object + posOffset;
+                            SnapshotValue v{};
+                            std::memcpy(&v, reinterpret_cast<const void*>(
+                                                position),
+                                        sizeof(v));
+                            if (plausibleCoords(v)) {
+                                positionAddress_.store(position);
+                                objectAddress_.store(object);
+                                vftableAddress_.store(vftableValue);
+                                found_.store(true);
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (found) {
+                        break;
+                    }
+                    address = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) +
+                              mbi.RegionSize;
+                }
+                if (found) {
+                    Logger::info("[esp] offsets restored from cfg - position "
+                                 "tracking live (instant)");
+                    return true;
+                }
+                Logger::info("[esp] saved offsets did not match - running "
+                             "full calibration");
+            }
+        }
+    }
+
     thread_ = std::thread(&PositionDiscovery::threadProc, this);
     return true;
 }
@@ -477,6 +554,18 @@ void PositionDiscovery::threadProc() {
             Logger::info("[esp] containing object 0x{:016X} vftable 0x{:016X} "
                          "(delta {} bytes)",
                          objectStart, vftable, entry.first - objectStart);
+            // Persist for instant restore in later sessions: the vftable's
+            // module-relative offset + the position offset from the object.
+            FILE* cfg = nullptr;
+            if (fopen_s(&cfg, kOffsetsCfg, "w") == 0 && cfg != nullptr) {
+                std::fprintf(cfg, "%llx %llx\n",
+                             static_cast<unsigned long long>(
+                                 vftable - gameModuleBase_),
+                             static_cast<unsigned long long>(
+                                 entry.first - objectStart));
+                std::fclose(cfg);
+                Logger::info("[esp] offsets saved for instant restore");
+            }
         }
         Logger::info("[esp] discovery complete - position tracking live");
     } catch (const std::exception& e) {

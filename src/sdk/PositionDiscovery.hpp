@@ -27,8 +27,9 @@ namespace yuzora::sdk {
 class PositionDiscovery {
 public:
     // Starts the discovery thread (game mode only). The player must be in a
-    // world and moving for the scan to converge.
-    bool start();
+    // world and moving for the scan to converge. gameModuleBase is used to
+    // persist the discovered offsets for instant reuse in later sessions.
+    bool start(std::uintptr_t gameModuleBase);
 
     // Stops the thread.
     void stop();
@@ -57,9 +58,8 @@ public:
 
 private:
     void threadProc();
-    struct Region;
 
-    void scanPass();
+    std::uintptr_t gameModuleBase_ = 0;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> found_{false};
